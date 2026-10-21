@@ -37,6 +37,7 @@ from telegram_audio_branding import (
     resolve_audio_cover_path,
 )
 from telegram_call_rejection import TelegramCallRejectCoordinator
+from telegram_profile_picture import poll_profile_picture_requests
 from telegram_events import (
     PHONE_CALL_SUBTYPES,
     incoming_call_discard_request,
@@ -68,6 +69,10 @@ SESSION_FILE = str(DATA_DIR / "tg_session")
 HEALTH_FILE = DATA_DIR / "tg_userbot_health.json"
 IDENTITY_FILE = DATA_DIR / "tg_identity.json"
 AUTHORIZED_MARKER_FILE = DATA_DIR / "tg_session_authorized.json"
+PROFILE_PICTURE_CANONICAL_PATH = BASE_DIR / "assets" / "pecadosvip-profile-logo.png"
+PROFILE_PICTURE_PATH = Path(
+    os.environ.get("TG_PROFILE_PICTURE_PATH") or PROFILE_PICTURE_CANONICAL_PATH
+)
 INTERACTION_STATE_FILE = DATA_DIR / "tg_interaction_state.json"
 INTERACTION_HEALTH_FILE = DATA_DIR / "tg_interaction_health.json"
 TELEGRAM_SEND_TIMEOUT_SECONDS = 20
@@ -732,16 +737,27 @@ async def main() -> None:
             write_health(True)
             heartbeat_task = asyncio.create_task(heartbeat())
             missed_call_task = asyncio.create_task(poll_recent_missed_calls())
+            profile_picture_task = asyncio.create_task(
+                poll_profile_picture_requests(
+                    client,
+                    me,
+                    DATA_DIR,
+                    PROFILE_PICTURE_PATH,
+                    canonical_image_path=PROFILE_PICTURE_CANONICAL_PATH,
+                )
+            )
             try:
                 await client.run_until_disconnected()
             finally:
                 update_interaction_health(connection="closed")
                 heartbeat_task.cancel()
                 missed_call_task.cancel()
+                profile_picture_task.cancel()
                 try:
                     await asyncio.gather(
                         heartbeat_task,
                         missed_call_task,
+                        profile_picture_task,
                     )
                 except asyncio.CancelledError:
                     pass

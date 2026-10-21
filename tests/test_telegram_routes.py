@@ -1,6 +1,8 @@
 import os
 import time
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import app as app_module
@@ -16,6 +18,11 @@ class TelegramRoutesTestCase(unittest.TestCase):
     OPERATOR_KEY = "telegram-route-test-key-" + ("K" * 32)
 
     def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        data_patcher = patch.object(app_module, "DATA_DIR", Path(temporary.name))
+        data_patcher.start()
+        self.addCleanup(data_patcher.stop)
         operator_key_patcher = patch.object(
             app_module,
             "_configured_operator_recovery_key",

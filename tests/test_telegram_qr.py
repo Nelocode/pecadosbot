@@ -253,6 +253,11 @@ class TelegramQrRoutesTestCase(unittest.TestCase):
     QR_URL = "tg://login?token=" + "fake_token_" * 4
 
     def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        data_patcher = patch.object(app_module, "DATA_DIR", Path(temporary.name))
+        data_patcher.start()
+        self.addCleanup(data_patcher.stop)
         operator_key = install_operator_key(self)
         app_module.app.config.update(TESTING=True)
         self.client = app_module.app.test_client()
