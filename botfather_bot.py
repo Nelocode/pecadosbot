@@ -22,8 +22,10 @@ from message_schema import load_message_file
 from telegram_audio_branding import resolve_audio_branding
 
 # ── Config ────────────────────────────────────────────────────────────
+from instance_paths import resolve_instance_data_directory
+
 BASE_DIR = Path(__file__).parent
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = resolve_instance_data_directory(BASE_DIR)
 AUDIO_DIR = DATA_DIR / "audios"
 VIDEO_DIR = DATA_DIR / "videos"
 AUDIO_BRANDING_DEFAULTS_FILE = BASE_DIR / "telegram_audio_branding.defaults.json"

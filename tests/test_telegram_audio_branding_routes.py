@@ -45,12 +45,12 @@ class TelegramAudioBrandingRoutesTests(unittest.TestCase):
     def headers(self, token=None):
         return {"X-Channel-CSRF": token or self.CSRF}
 
-    def test_get_returns_packaged_madrid_value_without_internal_paths(self):
+    def test_get_returns_packaged_pecadosvip_value_without_internal_paths(self):
         response = self.client.get("/api/telegram_audio_branding")
 
         self.assertEqual(200, response.status_code)
         self.assertEqual(
-            {"ok": True, "title": "Las Fiesteras", "performer": "Caché Madrid"},
+            {"ok": True, "title": "PecadosVIP", "performer": "PecadosVIP"},
             response.get_json(),
         )
         self.assertEqual("no-store", response.headers["Cache-Control"])
@@ -133,7 +133,7 @@ class TelegramAudioBrandingRoutesTests(unittest.TestCase):
             headers=self.headers(),
         )
         self.assertEqual(200, performer_only.status_code)
-        self.assertEqual("Las Fiesteras", performer_only.get_json()["title"])
+        self.assertEqual("PecadosVIP", performer_only.get_json()["title"])
 
         title_only = self.client.post(
             "/api/telegram_audio_branding",
@@ -142,6 +142,24 @@ class TelegramAudioBrandingRoutesTests(unittest.TestCase):
         )
         self.assertEqual(200, title_only.status_code)
         self.assertEqual("Agencia Madrid", title_only.get_json()["performer"])
+
+    def test_get_filters_known_legacy_settings_without_rewriting_them(self):
+        original = json.dumps({"title": "Las Fiesteras", "performer": "Caché Madrid"}).encode()
+        self.settings_file.write_bytes(original)
+        response = self.client.get("/api/telegram_audio_branding")
+        self.assertEqual({"ok": True, "title": "PecadosVIP", "performer": "PecadosVIP"}, response.get_json())
+        self.assertEqual(original, self.settings_file.read_bytes())
+
+    def test_save_rejects_known_legacy_brand_and_preserves_previous_settings(self):
+        original = json.dumps({"title": "Propio", "performer": "Agencia propia"}).encode()
+        self.settings_file.write_bytes(original)
+        self.authorize_browser()
+        for payload in ({"title": "Las Fiesteras"}, {"performer": "Caché Madrid"}):
+            with self.subTest(payload=payload):
+                response = self.client.post("/api/telegram_audio_branding", json=payload, headers=self.headers())
+                self.assertEqual(400, response.status_code)
+                self.assertIn("PecadosVIP", response.get_json()["error"])
+                self.assertEqual(original, self.settings_file.read_bytes())
 
 
 if __name__ == "__main__":

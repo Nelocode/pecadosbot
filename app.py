@@ -53,9 +53,11 @@ from test_mode import (
 )
 from wa_safety import public_wa_safety_health, set_wa_operator_paused
 
+from instance_paths import resolve_instance_data_directory
+
 BASE_DIR = Path(__file__).parent
 PROFILE_LOGO_PATH = BASE_DIR / "assets" / "pecadosvip-profile-logo.png"
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = resolve_instance_data_directory(BASE_DIR)
 AUDIO_DIR = DATA_DIR / "audios"
 VIDEO_DIR = DATA_DIR / "videos"
 MESSAGES_FILE = DATA_DIR / "messages.json"
@@ -349,14 +351,14 @@ label { color: #c8c8e0 !important; font-weight: 500; }
           <label for="tg-audio-performer" class="form-label small">Nombre de la agencia</label>
           <input id="tg-audio-performer" type="text" maxlength="80"
                  class="form-control form-control-sm"
-                 placeholder="Caché Madrid"
+                 placeholder="PecadosVIP"
                  oninput="markTelegramAudioBrandingDirty()">
         </div>
         <div class="col-md-6">
           <label for="tg-audio-title" class="form-label small">Título del audio</label>
           <input id="tg-audio-title" type="text" maxlength="80"
                  class="form-control form-control-sm"
-                 placeholder="Las Fiesteras"
+                 placeholder="PecadosVIP"
                  oninput="markTelegramAudioBrandingDirty()">
         </div>
       </div>
@@ -639,8 +641,8 @@ function renderTelegramAudioBranding(branding) {
     );
     return;
   }
-  const performer = String(branding.performer || "");
-  const title = String(branding.title || "Las Fiesteras");
+  const performer = String(branding.performer || "PecadosVIP");
+  const title = String(branding.title || "PecadosVIP");
   performerInput.value = performer;
   titleInput.value = title;
   renderTelegramAudioBrandingPreview(performer, title);
@@ -2755,10 +2757,22 @@ def _operator_recovery_key_version(configured_key: str) -> str | None:
 
 
 def _channel_worker_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
-    """Build a worker environment that cannot inherit the panel operator key."""
+    """Keep worker paths within this panel; never inherit another brand's paths."""
 
     worker_env = os.environ.copy()
     worker_env.pop(PANEL_ADMIN_RECOVERY_KEY_ENV, None)
+    worker_env.update({
+        "BOT_DIR": str(BASE_DIR),
+        "WA_AUTH_DIR": str(WA_AUTH_DIR),
+        "WA_QR_PATH": str(BASE_DIR / "wa_qr.png"),
+        "WA_HEALTH_FILE": str(WA_CALL_HEALTH_FILE),
+        "WA_IDENTITY_FILE": str(WA_IDENTITY_FILE),
+        "WA_SAFETY_HEALTH_FILE": str(DATA_DIR / "wa_safety_health.json"),
+        "WA_SAFETY_CONTROL_FILE": str(DATA_DIR / "wa_safety_control.json"),
+        "WA_INTERACTION_STATE_FILE": str(DATA_DIR / "wa_interaction_state.json"),
+        "WA_VOICE_NOTE_CACHE_DIR": str(DATA_DIR / "wa_voice_notes"),
+        "WA_PROFILE_PICTURE_STATE_FILE": str(DATA_DIR / "wa_profile_picture_state.json"),
+    })
     if extra:
         worker_env.update(extra)
     return worker_env
@@ -3047,17 +3061,15 @@ def _tracked_telegram_pid() -> int | None:
         pid = int(pid_file.read_text(encoding="ascii").strip())
         if pid <= 1 or pid == os.getpid():
             return None
-        os.kill(pid, 0)
-        return pid
+        return pid if _process_may_be_alive(pid) else None
     except (OSError, ValueError):
         return None
 
 
-def _windows_process_command_line(pid: int) -> str:
-    """Obtiene la línea de comando para no terminar un PID reciclado en Windows."""
-
+def _windows_process_information(pid: int) -> dict:
+    """Read command line and creation identity together, without changing the process."""
     if sys.platform != "win32" or pid <= 1:
-        return ""
+        return {}
     try:
         result = subprocess.run(
             [
@@ -3065,20 +3077,57 @@ def _windows_process_command_line(pid: int) -> str:
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {int(pid)}').CommandLine",
+                f"$worker = Get-CimInstance Win32_Process -Filter 'ProcessId = {int(pid)}'; "
+                "if ($worker) { @{ command_line = $worker.CommandLine; "
+                "started_at = $worker.CreationDate.ToUniversalTime().ToString('o') } "
+                "| ConvertTo-Json -Compress }",
             ],
             capture_output=True,
             text=True,
             timeout=3,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        return result.stdout.strip() if result.returncode == 0 else ""
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return ""
+        record = json.loads(result.stdout) if result.returncode == 0 else {}
+        return record if isinstance(record, dict) else {}
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return {}
+
+
+def _windows_process_command_line(pid: int) -> str:
+    record = _windows_process_information(pid)
+    value = record.get("command_line")
+    return value if isinstance(value, str) else ""
+
+
+def _windows_command_line_arguments(command_line: str) -> list[str]:
+    """Use Windows quoting rules; whitespace splitting cannot identify a script."""
+    if not command_line or sys.platform != "win32":
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        split = ctypes.windll.shell32.CommandLineToArgvW
+        split.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+        split.restype = ctypes.POINTER(wintypes.LPWSTR)
+        count = ctypes.c_int()
+        arguments = split(command_line, ctypes.byref(count))
+        if not arguments:
+            return []
+        try:
+            return [arguments[index] for index in range(count.value)]
+        finally:
+            free = ctypes.windll.kernel32.LocalFree
+            free.argtypes = [ctypes.c_void_p]
+            free.restype = ctypes.c_void_p
+            free(ctypes.cast(arguments, ctypes.c_void_p))
+    except (AttributeError, OSError, ValueError):
+        return []
 
 
 def _posix_process_command_line(pid: int) -> str:
-    """Obtiene la línea de comando en Linux (/proc) o macOS/BSD (ps)."""
+    """Diagnostic text only; ps output cannot establish exact argv ownership."""
 
     if sys.platform == "win32" or pid <= 1:
         return ""
@@ -3104,35 +3153,155 @@ def _posix_process_command_line(pid: int) -> str:
         return ""
 
 
+def _worker_process_snapshot(pid: int) -> tuple[list[str], str | None, str] | None:
+    if not isinstance(pid, int) or pid <= 1 or pid == os.getpid():
+        return None
+    if sys.platform == "win32":
+        record = _windows_process_information(pid)
+        command_line, started_at = record.get("command_line"), record.get("started_at")
+        if not isinstance(command_line, str) or not isinstance(started_at, str) or not started_at:
+            return None
+        # CIM exposes no cwd. Only absolute script arguments are accepted below.
+        return _windows_command_line_arguments(command_line), None, started_at
+    try:
+        process_dir = Path(f"/proc/{pid}")
+        # Field 22 follows the parenthesized comm field, which may contain spaces.
+        before = (process_dir / "stat").read_text().rsplit(")", 1)[1].split()[19]
+        raw_arguments = (process_dir / "cmdline").read_bytes()
+        cwd = os.readlink(process_dir / "cwd")
+        after = (process_dir / "stat").read_text().rsplit(")", 1)[1].split()[19]
+        if before != after or not before.isdigit() or not raw_arguments.endswith(b"\0"):
+            return None
+        return [os.fsdecode(part) for part in raw_arguments[:-1].split(b"\0")], cwd, before
+    except (OSError, ValueError, IndexError):
+        # Fail closed if /proc cannot provide argv boundaries and cwd. A human-
+        # readable ps string is insufficient to authorize terminating a worker.
+        return None
+
+
+def _worker_arguments_match_instance(arguments: list[str], cwd: str | None, script_name: str) -> bool:
+    # These are the two-argument commands emitted by this panel and entrypoint.
+    # Refuse interpreters running -c/-e/-m, wrappers and extra script arguments.
+    if len(arguments) != 2 or not all(isinstance(value, str) and value for value in arguments):
+        return False
+    executable = re.split(r"[\\/]", arguments[0])[-1].lower()
+    if script_name == "wa_bot.mjs":
+        if executable not in {"node", "nodejs", "node.exe"}:
+            return False
+    elif script_name in {"bot.py", "botfather_bot.py"}:
+        if not re.fullmatch(r"pythonw?(?:\d+(?:\.\d+)*)?(?:\.exe)?", executable):
+            return False
+    else:
+        return False
+    try:
+        instance_dir = BASE_DIR.resolve()
+        if cwd is not None and (not Path(cwd).is_absolute() or Path(cwd).resolve() != instance_dir):
+            return False
+        script_path = Path(arguments[1])
+        if not script_path.is_absolute():
+            if cwd is None:
+                return False
+            script_path = Path(cwd) / script_path
+        return script_path.resolve() == instance_dir / script_name
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def _instance_worker_token(pid: int, script_name: str) -> tuple | None:
+    snapshot = _worker_process_snapshot(pid)
+    if snapshot is None:
+        return None
+    arguments, cwd, started_at = snapshot
+    if not _worker_arguments_match_instance(arguments, cwd, script_name):
+        return None
+    return tuple(arguments), cwd, started_at
+
+
+def _unlink_unchanged_pid_file(pid_file: Path, original_contents: str | None) -> bool:
+    try:
+        if original_contents is not None and pid_file.read_text(encoding="ascii") == original_contents:
+            pid_file.unlink(missing_ok=True)
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def _pid_file_contents(pid_file: Path) -> str | None:
+    try:
+        return pid_file.read_text(encoding="ascii")
+    except (OSError, ValueError):
+        return None
+
+
 def _is_telegram_worker_pid(pid: int) -> bool:
-    """Evita terminar BotFather u otro proceso si el PID quedó obsoleto."""
-    if sys.platform != "win32":
-        cmdline = _posix_process_command_line(pid)
-        return "bot.py" in cmdline and "botfather_bot.py" not in cmdline and "restart_bot.py" not in cmdline
-    cmdline = _windows_process_command_line(pid).lower()
-    return "bot.py" in cmdline and "botfather_bot.py" not in cmdline and "restart_bot.py" not in cmdline
+    return _instance_worker_token(pid, "bot.py") is not None
+
+
+class WorkerOwnershipError(RuntimeError):
+    """A live PID cannot be safely managed by this instance."""
+
+
+def _process_may_be_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        # EPERM does not establish absence; never use it to allow a replacement.
+        return True
+    if sys.platform.startswith("linux"):
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            # An exited child can remain in /proc until its parent reaps it.
+            if state in {"Z", "X"}:
+                return False
+        except (OSError, ValueError, IndexError):
+            pass
+    return True
+
+
+def _terminate_instance_worker(pid: int, script_name: str) -> None:
+    ownership = _instance_worker_token(pid, script_name)
+    if ownership is None:
+        raise WorkerOwnershipError("No se pudo verificar la pertenencia del proceso a esta instancia.")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError:
+        raise WorkerOwnershipError("No se pudo confirmar la parada del proceso de esta instancia.") from None
+    for _ in range(20):
+        if not _process_may_be_alive(pid):
+            return
+        time.sleep(0.1)
+    # A reused or uninspectable PID must not be signalled or treated as stopped.
+    if sys.platform == "win32" or _instance_worker_token(pid, script_name) != ownership:
+        if not _process_may_be_alive(pid):
+            return
+        raise WorkerOwnershipError("No se pudo confirmar la parada del proceso de esta instancia.")
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except OSError:
+        raise WorkerOwnershipError("No se pudo confirmar la parada del proceso de esta instancia.") from None
+    for _ in range(20):
+        if not _process_may_be_alive(pid):
+            return
+        time.sleep(0.1)
+    raise WorkerOwnershipError("No se pudo confirmar la parada del proceso de esta instancia.")
 
 
 def _stop_telegram_worker() -> None:
     pid_file = DATA_DIR / "tg_userbot.pid"
+    original_contents = _pid_file_contents(pid_file)
     pid = _tracked_telegram_pid()
-    if pid and _is_telegram_worker_pid(pid):
-        try:
-            os.kill(pid, signal.SIGTERM)
-            for _ in range(20):
-                try:
-                    os.kill(pid, 0)
-                except OSError:
-                    break
-                time.sleep(0.1)
-            else:
-                if sys.platform != "win32":
-                    os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
+    if pid:
+        _terminate_instance_worker(pid, "bot.py")
     try:
-        pid_file.unlink(missing_ok=True)
-        (DATA_DIR / "tg_userbot_health.json").unlink(missing_ok=True)
+        if _unlink_unchanged_pid_file(pid_file, original_contents):
+            (DATA_DIR / "tg_userbot_health.json").unlink(missing_ok=True)
     except OSError:
         pass
 
@@ -3145,10 +3314,11 @@ def restart_telegram_worker() -> tuple[bool, str]:
     if not api_id or not api_hash or not phone or not _telegram_session_is_authorized():
         return False, "Telegram aún no tiene una sesión autorizada."
 
-    _stop_telegram_worker()
-    log_path = Path(os.environ.get("TG_LOG_PATH", "/tmp/bot_tg.log"))
-    if sys.platform == "win32" and str(log_path).startswith("/tmp/"):
-        log_path = DATA_DIR / "bot_tg.log"
+    try:
+        _stop_telegram_worker()
+    except WorkerOwnershipError as error:
+        return False, str(error)
+    log_path = DATA_DIR / "bot_tg.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     env = _channel_worker_environment({
         "TG_API_ID": str(api_id),
@@ -4843,16 +5013,17 @@ def api_link_botfather():
 
 
 def bf_is_running():
-    """Verifica si el BotFather bot está corriendo (por archivo PID)."""
+    """Report only a BotFather worker belonging to this instance."""
     pid_file = DATA_DIR / "botfather.pid"
     try:
         if not pid_file.exists():
             return False
         with open(pid_file, "r") as f:
             pid = int(f.read().strip())
+        if pid <= 1 or pid == os.getpid():
+            return False
         # Verificar que el proceso siga vivo
-        os.kill(pid, 0)
-        return True
+        return _process_may_be_alive(pid) and _instance_worker_token(pid, "botfather_bot.py") is not None
     except (OSError, ValueError):
         return False
 
@@ -4861,16 +5032,13 @@ def _tracked_wa_pid(pid_file: Path) -> int | None:
         pid = int(pid_file.read_text(encoding="ascii").strip())
         if pid <= 1 or pid == os.getpid():
             return None
-        os.kill(pid, 0)
-        return pid
+        return pid if _process_may_be_alive(pid) else None
     except (OSError, ValueError):
         return None
 
 
 def _is_wa_worker_pid(pid: int) -> bool:
-    if sys.platform != "win32":
-        return "wa_bot.mjs" in _posix_process_command_line(pid)
-    return "wa_bot.mjs" in _windows_process_command_line(pid).lower()
+    return _instance_worker_token(pid, "wa_bot.mjs") is not None
 
 
 def _wa_process_running(pid_file: Path) -> bool:
@@ -4879,22 +5047,11 @@ def _wa_process_running(pid_file: Path) -> bool:
 
 
 def _stop_wa_process(pid_file: Path) -> None:
+    original_contents = _pid_file_contents(pid_file)
     pid = _tracked_wa_pid(pid_file)
-    if pid and _is_wa_worker_pid(pid):
-        try:
-            os.kill(pid, signal.SIGTERM)
-            for _ in range(20):
-                try:
-                    os.kill(pid, 0)
-                except OSError:
-                    break
-                time.sleep(0.1)
-            else:
-                if sys.platform != "win32":
-                    os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
-    pid_file.unlink(missing_ok=True)
+    if pid:
+        _terminate_instance_worker(pid, "wa_bot.mjs")
+    _unlink_unchanged_pid_file(pid_file, original_contents)
 
 
 def _start_wa_process(
@@ -4918,9 +5075,7 @@ def _start_wa_process(
         "WA_LINK_ONLY": "1" if link_only else "0",
         "WA_LINK_TIMEOUT_MS": str(WA_SWITCH_TIMEOUT_SECONDS * 1000),
     })
-    log_path = Path("/tmp") / log_name
-    if sys.platform == "win32":
-        log_path = DATA_DIR / log_name
+    log_path = DATA_DIR / log_name
     log_path.parent.mkdir(parents=True, exist_ok=True)
     kwargs = {
         "cwd": str(BASE_DIR),
@@ -4972,7 +5127,10 @@ def restart_wa_bot() -> int | None:
 
     with _wa_process_lock:
         pid_file = DATA_DIR / "wa_bot.pid"
-        _stop_wa_process(pid_file)
+        try:
+            _stop_wa_process(pid_file)
+        except WorkerOwnershipError:
+            return None
         return _start_wa_process(
             auth_dir=WA_AUTH_DIR,
             qr_file=BASE_DIR / "wa_qr.png",
@@ -5327,6 +5485,51 @@ def _reap_expired_wa_switch() -> None:
         _cleanup_wa_switch_files()
 
 
+def _wa_profile_account_hash(identity_path: Path) -> str | None:
+    try:
+        value = json.loads(identity_path.read_text(encoding="utf-8")).get("account_hash")
+        return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _queue_wa_profile_picture(expected_account_hash: str | None) -> dict:
+    """Authorize the promoted identity only; an ordinary worker boot never queues."""
+    if os.environ.get("WA_PROFILE_PICTURE_ENABLED", "1") == "0":
+        return {"status": "disabled", "message": "La foto automática está desactivada."}
+    account_hash = _wa_profile_account_hash(WA_IDENTITY_FILE)
+    if not expected_account_hash or account_hash != expected_account_hash:
+        return {"status": "failed", "message": "No se pudo verificar la cuenta promovida para actualizar su foto."}
+    image_path = Path(os.environ.get("WA_PROFILE_PICTURE_PATH") or PROFILE_LOGO_PATH)
+    if not official_image_matches(image_path, PROFILE_LOGO_PATH):
+        return {"status": "failed", "message": "La imagen configurada no coincide con el logotipo oficial de PecadosVIP."}
+    destination = DATA_DIR / "wa_profile_picture_request.json"
+    request_id = secrets.token_hex(16)
+    temporary = destination.with_name(destination.name + "." + request_id + ".tmp")
+    try:
+        requested_at = int(time.time() * 1000)
+        payload = {
+            "brand": "pecadosvip", "requestId": request_id, "status": "pending",
+            "accountHash": account_hash,
+            "imageHash": hashlib.sha256(PROFILE_LOGO_PATH.read_bytes()).hexdigest(),
+            "requestedAt": requested_at, "expiresAt": requested_at + 600_000,
+        }
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with temporary.open("x", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except OSError:
+        return {"status": "failed", "message": "La cuenta está vinculada, pero no se pudo guardar la solicitud de foto."}
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return {"status": "pending", "message": "El logotipo se aplicará a la cuenta de WhatsApp recién vinculada."}
+
+
 def _promote_wa_candidate() -> tuple[bool, str, dict, bool, bool]:
     """Promueve la cuenta escaneada y restaura la anterior si no queda online."""
 
@@ -5342,6 +5545,7 @@ def _promote_wa_candidate() -> tuple[bool, str, dict, bool, bool]:
             return False, "WhatsApp no guardó la nueva sesión.", {}, True, _wa_connection_open()
 
         candidate_identity = _read_safe_identity(WA_SWITCH_IDENTITY_FILE)
+        candidate_account_hash = _wa_profile_account_hash(WA_SWITCH_IDENTITY_FILE)
         rollback_auth = WA_SWITCH_DIR / "rollback_auth"
         rollback_state = WA_SWITCH_DIR / "rollback_interaction_state.json"
         rollback_identity = WA_SWITCH_DIR / "rollback_identity.json"
@@ -5443,7 +5647,12 @@ def _promote_wa_candidate() -> tuple[bool, str, dict, bool, bool]:
         _cleanup_wa_switch_candidate()
         session["channel_admin"] = True
         session.permanent = True
-        return True, "Cuenta de WhatsApp cambiada y verificada.", candidate_identity, True, True
+        profile_photo = _queue_wa_profile_picture(candidate_account_hash)
+        candidate_identity["profile_photo"] = profile_photo
+        message = "Cuenta de WhatsApp cambiada y verificada."
+        if profile_photo["status"] == "failed":
+            message += " " + profile_photo["message"]
+        return True, message, candidate_identity, True, True
 
 @app.route("/api/restart_bot", methods=["POST"])
 def api_restart_bot():
@@ -5813,7 +6022,7 @@ def api_channels():
             "switch_owned_by_this_browser": wa_switch_owned if can_manage else False,
             "profile_photo": whatsapp_profile_picture_status(
                 WA_IDENTITY_FILE,
-                Path(os.environ.get("WA_PROFILE_PICTURE_STATE_FILE") or DATA_DIR / "wa_profile_picture_state.json"),
+                DATA_DIR / "wa_profile_picture_state.json",
                 Path(os.environ.get("WA_PROFILE_PICTURE_PATH") or PROFILE_LOGO_PATH),
                 PROFILE_LOGO_PATH,
                 enabled=os.environ.get("WA_PROFILE_PICTURE_ENABLED", "1") != "0",
@@ -5831,6 +6040,13 @@ def api_start_botfather():
     if bf_is_running():
         return jsonify({"ok": True, "message": "BotFather ya está corriendo"})
 
+    tracked_pid = _tracked_wa_pid(DATA_DIR / "botfather.pid")
+    if tracked_pid and _instance_worker_token(tracked_pid, "botfather_bot.py") is None:
+        return jsonify({
+            "ok": False,
+            "error": "No se pudo verificar la pertenencia del proceso de BotFather a esta instancia.",
+        }), 409
+
     token = os.environ.get("AUTOREPLY_BOT_TOKEN") or _read_env_var("AUTOREPLY_BOT_TOKEN")
     if not token:
         return jsonify({"ok": False, "error": "Token no configurado"}), 400
@@ -5845,6 +6061,7 @@ def api_start_botfather():
             proc = subprocess.Popen(
                 [sys.executable, bot_script],
                 stdout=f, stderr=subprocess.STDOUT,
+                cwd=str(BASE_DIR),
                 env=_channel_worker_environment(),
                 start_new_session=True
             )

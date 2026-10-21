@@ -48,6 +48,17 @@ _DELIVERY_LABELS = {
 }
 
 
+def telegram_user_matches_phone(user: Any, phone: str | None) -> bool:
+    """Accept only the intended user account, never a bot or unknown identity."""
+    actual = re.sub(r"\D", "", str(getattr(user, "phone", "") or ""))
+    expected = re.sub(r"\D", "", str(phone or ""))
+    return bool(
+        7 <= len(actual) <= 15
+        and actual == expected
+        and not getattr(user, "bot", False)
+    )
+
+
 def describe_sent_code(sent_code: Any) -> dict[str, Any]:
     """Convierte el tipo TL de Telegram en datos públicos y comprensibles."""
 
@@ -375,7 +386,10 @@ class TelegramAuthManager:
         try:
             await client.connect()
             if await client.is_user_authorized():
+                user = await client.get_me()
                 await self._disconnect(client)
+                if not telegram_user_matches_phone(user, phone):
+                    return self._wrong_account()
                 return AuthOutcome(
                     {"ok": True, "already_authorized": True},
                     (api_id, api_hash, phone),
@@ -422,9 +436,15 @@ class TelegramAuthManager:
 
     @staticmethod
     def _qr_account_matches(user: Any, phone: str) -> bool:
-        actual = re.sub(r"\D", "", str(getattr(user, "phone", "") or ""))
-        expected = re.sub(r"\D", "", phone)
-        return bool(actual and actual == expected and not getattr(user, "bot", False))
+        return telegram_user_matches_phone(user, phone)
+
+    @staticmethod
+    def _wrong_account() -> AuthOutcome:
+        return AuthOutcome({
+            "ok": False,
+            "error_code": "account_mismatch",
+            "error": "La sesión de Telegram no corresponde a la cuenta indicada o no se pudo verificar su identidad. No se activó la cuenta.",
+        })
 
     @staticmethod
     def _wrong_qr_account() -> AuthOutcome:
@@ -618,6 +638,10 @@ class TelegramAuthManager:
                     "error": "Telegram no confirmó la sesión.",
                 })
 
+            user = await client.get_me()
+            if not telegram_user_matches_phone(user, pending["phone"]):
+                await self._clear_pending()
+                return self._wrong_account()
             credentials = (pending["api_id"], pending["api_hash"], pending["phone"])
             await self._clear_pending()
             return AuthOutcome({"ok": True}, credentials)
@@ -661,6 +685,10 @@ class TelegramAuthManager:
                     "error": "Telegram no confirmó la sesión.",
                 })
 
+            user = await client.get_me()
+            if not telegram_user_matches_phone(user, pending["phone"]):
+                await self._clear_pending()
+                return self._wrong_account()
             credentials = (pending["api_id"], pending["api_hash"], pending["phone"])
             await self._clear_pending()
             return AuthOutcome({"ok": True}, credentials)

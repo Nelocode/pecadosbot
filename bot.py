@@ -37,6 +37,7 @@ from telegram_audio_branding import (
     resolve_audio_cover_path,
 )
 from telegram_call_rejection import TelegramCallRejectCoordinator
+from telegram_auth import telegram_user_matches_phone
 from telegram_profile_picture import poll_profile_picture_requests
 from telegram_events import (
     PHONE_CALL_SUBTYPES,
@@ -56,8 +57,10 @@ from telegram_dispatcher import (
 )
 
 
+from instance_paths import resolve_instance_data_directory
+
 BASE_DIR = Path(__file__).parent
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = resolve_instance_data_directory(BASE_DIR)
 AUDIO_DIR = DATA_DIR / "audios"
 VIDEO_DIR = DATA_DIR / "videos"
 AUDIO_COVER_PATH = resolve_audio_cover_path(BASE_DIR)
@@ -201,6 +204,10 @@ def get_response_message(language: str, response_key: str) -> tuple[str, str]:
 
 client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
 self_user_id: int | None = None
+telegram_identity_verified = False
+telegram_identity_attempt: asyncio.Future | None = None
+TELEGRAM_IDENTITY_TIMEOUT_SECONDS = 30
+TELEGRAM_DISCONNECT_TIMEOUT_SECONDS = 10
 call_reject_coordinator = TelegramCallRejectCoordinator(
     limit=RECENT_CALL_REJECTION_LIMIT,
 )
@@ -273,6 +280,8 @@ def update_delivery_health(stage: str, state: str) -> None:
 async def reject_incoming_call(update) -> str:
     """Reject one incoming call while duplicate updates share the same RPC."""
 
+    if not telegram_identity_verified:
+        return "identity_unverified"
     request = incoming_call_discard_request(update, self_user_id=self_user_id)
     if request is None:
         return "not_incoming"
@@ -352,13 +361,15 @@ def write_identity(user) -> None:
 
 async def heartbeat() -> None:
     while True:
-        write_health(client.is_connected())
+        write_health(telegram_identity_verified and client.is_connected())
         await asyncio.sleep(15)
 
 
 async def _retry_telegram_operation(label: str, operation):
     last_error = None
     for attempt in range(1, TELEGRAM_SEND_RETRIES + 1):
+        if not telegram_identity_verified:
+            raise RuntimeError("Telegram account identity is not verified")
         try:
             result = await asyncio.wait_for(
                 operation(),
@@ -387,6 +398,8 @@ async def send_response(
     language: str,
     delivery_fingerprint: str,
 ) -> None:
+    if not telegram_identity_verified:
+        raise RuntimeError("Telegram account identity is not verified")
     load_messages_fresh()
     message_text, audio_file, video_file = get_response_components(language, response_key)
     update_interaction_health(
@@ -539,6 +552,8 @@ async def process_interaction(
     provisional_language: str | None = None,
     reply_peer: object | None = None,
 ) -> None:
+    if not telegram_identity_verified:
+        return
     decision = await telegram_dispatcher.dispatch(
         chat_id=chat_id,
         event_id=event_id,
@@ -567,9 +582,25 @@ async def process_interaction(
     )
 
 
+async def _wait_for_telegram_identity() -> bool:
+    """Hold an opaque event until this connection's identity decision is final."""
+    attempt = telegram_identity_attempt
+    if attempt is None:
+        return False
+    # One cancelled event must not cancel the decision for every other waiter.
+    accepted = await asyncio.shield(attempt)
+    return bool(
+        accepted
+        and attempt is telegram_identity_attempt
+        and telegram_identity_verified
+    )
+
+
 @client.on(events.NewMessage(incoming=True))
 async def handle_message(event) -> None:
     """Maneja una vez cada texto, voz, imagen, documento o multimedia."""
+    if not await _wait_for_telegram_identity():
+        return
     try:
         reply_peer = await event.get_input_chat()
     except (ValueError, TypeError):
@@ -601,6 +632,8 @@ async def handle_message(event) -> None:
 @client.on(events.Raw(types.UpdatePhoneCall))
 async def handle_phone_call(update) -> None:
     """Cuenta solicitudes de llamadas reales, no notas de voz."""
+    if not await _wait_for_telegram_identity():
+        return
     subtype = phone_call_subtype(update)
     revision = str(uuid.uuid4())
     revisions = dict(interaction_health["phone_revisions"])
@@ -632,6 +665,8 @@ async def handle_phone_call(update) -> None:
 @client.on(events.Raw(types.UpdateNewMessage))
 async def handle_missed_call_service(update) -> None:
     """Fallback para una llamada perdida recibida después de reconectar."""
+    if not await _wait_for_telegram_identity():
+        return
     message = getattr(update, "message", None)
     if isinstance(message, types.MessageService) and isinstance(
         getattr(message, "action", None), types.MessageActionPhoneCall
@@ -675,6 +710,8 @@ async def poll_recent_missed_calls() -> None:
 
     not_before = datetime.now(timezone.utc) - timedelta(seconds=45)
     while True:
+        if not telegram_identity_verified:
+            return
         try:
             # ``SearchGlobalRequest`` rejects InputMessagesFilterPhoneCalls.
             # The same filter is supported by messages.search when its peer is
@@ -710,34 +747,50 @@ async def poll_recent_missed_calls() -> None:
 
 
 async def main() -> None:
-    global self_user_id
+    global self_user_id, telegram_identity_verified, telegram_identity_attempt
     logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(message)s",
         level=logging.INFO,
     )
 
     while True:
+        telegram_identity_verified = False
+        self_user_id = None
+        attempt = asyncio.get_running_loop().create_future()
+        telegram_identity_attempt = attempt
+        worker_tasks = []
+        retry_delay = False
+        disconnect_failed = False
         try:
             logging.info("Starting Telegram User Bot...")
             update_interaction_health(connection="connecting")
-            await client.connect()
-            if not await client.is_user_authorized():
-                AUTHORIZED_MARKER_FILE.unlink(missing_ok=True)
-                logging.error(
-                    "La sesión de Telegram no está autorizada; completa la vinculación en el panel."
-                )
-                break
+            async with asyncio.timeout(TELEGRAM_IDENTITY_TIMEOUT_SECONDS):
+                await client.connect()
+                if not await client.is_user_authorized():
+                    AUTHORIZED_MARKER_FILE.unlink(missing_ok=True)
+                    logging.error(
+                        "La sesión de Telegram no está autorizada; completa la vinculación en el panel."
+                    )
+                    break
+                me = await client.get_me()
 
-            me = await client.get_me()
+            if not telegram_user_matches_phone(me, PHONE):
+                logging.error(
+                    "La sesión de Telegram no coincide con la cuenta configurada; no se procesarán interacciones."
+                )
+                write_health(False)
+                break
             self_user_id = me.id
             write_authorized_marker()
             write_identity(me)
+            telegram_identity_verified = True
+            attempt.set_result(True)
             logging.info("Telegram session authorized; user bot ready.")
             await client.catch_up()
             write_health(True)
-            heartbeat_task = asyncio.create_task(heartbeat())
-            missed_call_task = asyncio.create_task(poll_recent_missed_calls())
-            profile_picture_task = asyncio.create_task(
+            worker_tasks.append(asyncio.create_task(heartbeat()))
+            worker_tasks.append(asyncio.create_task(poll_recent_missed_calls()))
+            worker_tasks.append(asyncio.create_task(
                 poll_profile_picture_requests(
                     client,
                     me,
@@ -745,27 +798,8 @@ async def main() -> None:
                     PROFILE_PICTURE_PATH,
                     canonical_image_path=PROFILE_PICTURE_CANONICAL_PATH,
                 )
-            )
-            try:
-                await client.run_until_disconnected()
-            finally:
-                update_interaction_health(connection="closed")
-                heartbeat_task.cancel()
-                missed_call_task.cancel()
-                profile_picture_task.cancel()
-                try:
-                    await asyncio.gather(
-                        heartbeat_task,
-                        missed_call_task,
-                        profile_picture_task,
-                    )
-                except asyncio.CancelledError:
-                    pass
-                try:
-                    HEALTH_FILE.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                await client.disconnect()
+            ))
+            await client.run_until_disconnected()
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -773,6 +807,33 @@ async def main() -> None:
                 "Telegram UserBot disconnected or encountered error (%s); reconnecting in 5s",
                 type(exc).__name__,
             )
+            retry_delay = True
+        finally:
+            # Revoke the attempt synchronously, before any cleanup can yield.
+            telegram_identity_verified = False
+            self_user_id = None
+            if telegram_identity_attempt is attempt:
+                telegram_identity_attempt = None
+            if not attempt.done():
+                attempt.set_result(False)
+            update_interaction_health(connection="closed")
+            for task in worker_tasks:
+                task.cancel()
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
+            try:
+                HEALTH_FILE.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                async with asyncio.timeout(TELEGRAM_DISCONNECT_TIMEOUT_SECONDS):
+                    await client.disconnect()
+            except Exception as exc:
+                # Do not start another attempt while old handlers may survive.
+                logging.error("Telegram disconnect could not be confirmed (%s); worker stopped.", type(exc).__name__)
+                disconnect_failed = True
+        if disconnect_failed:
+            return
+        if retry_delay:
             await asyncio.sleep(5)
 
 

@@ -17,7 +17,7 @@ import { createWhatsAppMessageHandler } from './wa_message_handler.mjs';
 import { KeyedSerialQueue } from './keyed_serial_queue.mjs';
 import { classifyWhatsAppDisconnect } from './wa_disconnect_policy.mjs';
 import { createWhatsAppVoiceNoteReader, createWhatsAppVideoReader } from './wa_audio_delivery.mjs';
-import { applyWhatsAppProfilePicture, whatsappProfileAccountHash } from './wa_profile_picture.mjs';
+import { pollWhatsAppProfilePicture, whatsappProfileAccountHash } from './wa_profile_picture.mjs';
 import { createWhatsAppSafetyHealth } from './wa_safety_health.mjs';
 import {
   createWhatsAppDeliverySafety,
@@ -25,38 +25,26 @@ import {
   recordWhatsAppProviderSignal,
 } from './wa_delivery_safety.mjs';
 import { detectLanguageEvidence, reloadLanguageRules } from './language_detection.mjs';
+import { resolveWhatsAppInstancePaths } from './wa_instance_paths.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const BASE_DIR = path.resolve(process.env.BOT_DIR || __dirname);
-const DATA_DIR = path.join(BASE_DIR, 'data');
-const AUDIO_DIR = path.join(BASE_DIR, 'data', 'audios');
-const VIDEO_DIR = path.join(BASE_DIR, 'data', 'videos');
-const MESSAGES_FILE = path.join(BASE_DIR, 'data', 'messages.json');
-const AUTH_DIR = path.resolve(process.env.WA_AUTH_DIR || path.join(DATA_DIR, 'wa_auth'));
-const QR_PATH = path.resolve(process.env.WA_QR_PATH || path.join(BASE_DIR, 'wa_qr.png'));
-const CALL_HEALTH_FILE = path.resolve(
-  process.env.WA_HEALTH_FILE || path.join(DATA_DIR, 'wa_call_health.json'),
-);
-const SAFETY_HEALTH_FILE = path.resolve(
-  process.env.WA_SAFETY_HEALTH_FILE || path.join(DATA_DIR, 'wa_safety_health.json'),
-);
-const SAFETY_CONTROL_FILE = path.resolve(
-  process.env.WA_SAFETY_CONTROL_FILE || path.join(DATA_DIR, 'wa_safety_control.json'),
-);
-const INTERACTION_STATE_FILE = path.resolve(
-  process.env.WA_INTERACTION_STATE_FILE || path.join(DATA_DIR, 'wa_interaction_state.json'),
-);
-const VOICE_NOTE_CACHE_DIR = path.resolve(
-  process.env.WA_VOICE_NOTE_CACHE_DIR || path.join(DATA_DIR, 'wa_voice_notes'),
-);
-const OFFICIAL_PROFILE_PICTURE_PATH = path.join(BASE_DIR, 'assets', 'pecadosvip-profile-logo.png');
-const PROFILE_PICTURE_PATH = path.resolve(process.env.WA_PROFILE_PICTURE_PATH || OFFICIAL_PROFILE_PICTURE_PATH);
-const PROFILE_PICTURE_STATE_FILE = path.resolve(
-  process.env.WA_PROFILE_PICTURE_STATE_FILE || path.join(DATA_DIR, 'wa_profile_picture_state.json'),
-);
-const IDENTITY_FILE = path.resolve(
-  process.env.WA_IDENTITY_FILE || path.join(DATA_DIR, 'wa_identity.json'),
-);
+const instancePaths = resolveWhatsAppInstancePaths(__dirname);
+const BASE_DIR = instancePaths.baseDir;
+const DATA_DIR = instancePaths.dataDir;
+const AUDIO_DIR = instancePaths.audioDir;
+const VIDEO_DIR = instancePaths.videoDir;
+const MESSAGES_FILE = instancePaths.messagesFile;
+const AUTH_DIR = instancePaths.authDir;
+const QR_PATH = instancePaths.qrPath;
+const CALL_HEALTH_FILE = instancePaths.callHealthFile;
+const SAFETY_HEALTH_FILE = instancePaths.safetyHealthFile;
+const SAFETY_CONTROL_FILE = instancePaths.safetyControlFile;
+const INTERACTION_STATE_FILE = instancePaths.interactionStateFile;
+const VOICE_NOTE_CACHE_DIR = instancePaths.voiceNoteCacheDir;
+const OFFICIAL_PROFILE_PICTURE_PATH = instancePaths.officialImage;
+const PROFILE_PICTURE_PATH = instancePaths.profileImage;
+const PROFILE_PICTURE_STATE_FILE = instancePaths.profileStateFile;
+const IDENTITY_FILE = instancePaths.identityFile;
 const LINK_ONLY = process.env.WA_LINK_ONLY === '1';
 const VOICE_NOTES_ENABLED = process.env.WA_VOICE_NOTES_ENABLED !== '0';
 const PROFILE_PICTURE_ENABLED = process.env.WA_PROFILE_PICTURE_ENABLED !== '0';
@@ -103,6 +91,7 @@ let shuttingDown = false;
 let linkExpiryTimer = null;
 let activeDeliverySafety = null;
 let safetyHeartbeatTimer = null;
+let activeProfilePicturePoller = null;
 
 if (safetyHealth) {
   safetyHeartbeatTimer = setInterval(() => safetyHealth.touch(), SAFETY_HEARTBEAT_MS);
@@ -182,6 +171,8 @@ function terminateInvalidSession() {
   // credentials unusable. Preserve the health snapshot so the panel can
   // explain that a new QR is required.
   shuttingDown = true;
+  activeProfilePicturePoller?.stop();
+  activeProfilePicturePoller = null;
   if (reconnectTimer) clearTimeout(reconnectTimer);
   reconnectTimer = null;
   if (reconnectStabilityTimer) clearTimeout(reconnectStabilityTimer);
@@ -294,6 +285,8 @@ async function startBot() {
     browser: ['AutoReply Bot', 'Chrome', '120.0'],
   });
   activeSocket = sock;
+  activeProfilePicturePoller?.stop();
+  activeProfilePicturePoller = null;
   if (reconnectStabilityTimer) clearTimeout(reconnectStabilityTimer);
   reconnectStabilityTimer = null;
   activeDeliverySafety?.cancelAll('socket_replaced');
@@ -380,6 +373,8 @@ async function startBot() {
 
     if (connection === 'close') {
       if (activeSocket !== sock) return;
+      activeProfilePicturePoller?.stop();
+      activeProfilePicturePoller = null;
       if (connectionWatchdog) clearTimeout(connectionWatchdog);
       if (reconnectStabilityTimer) clearTimeout(reconnectStabilityTimer);
       reconnectStabilityTimer = null;
@@ -431,22 +426,28 @@ async function startBot() {
         console.warn('[WA] No fue posible actualizar la identidad mostrable');
       }
       if (!LINK_ONLY && PROFILE_PICTURE_ENABLED) {
-        let expectedImageHash = null;
-        try {
-          expectedImageHash = crypto.createHash('sha256')
-            .update(fs.readFileSync(OFFICIAL_PROFILE_PICTURE_PATH)).digest('hex');
-        } catch { /* The profile helper records official_image_missing and does not send. */ }
-        void applyWhatsAppProfilePicture({
-          jid: sock.user?.id,
-          updateProfilePicture: (jid, image, dimensions) => (
-            sock.updateProfilePicture(jid, image, dimensions)
-          ),
-          imagePath: PROFILE_PICTURE_PATH,
-          expectedImageHash,
-          statePath: PROFILE_PICTURE_STATE_FILE,
-          logger: console,
-        }).catch(() => {
-          console.warn('[WA] La sincronización del logo de perfil falló sin afectar el bot');
+        activeProfilePicturePoller?.stop();
+        activeProfilePicturePoller = pollWhatsAppProfilePicture({
+          isActive: () => activeSocket === sock && !shuttingDown,
+          getOptions: () => {
+            let expectedImageHash = null;
+            try {
+              expectedImageHash = crypto.createHash('sha256')
+                .update(fs.readFileSync(OFFICIAL_PROFILE_PICTURE_PATH)).digest('hex');
+            } catch { /* The helper records a missing image without sending. */ }
+            return {
+              jid: sock.user?.id,
+              updateProfilePicture: (jid, image, dimensions) => {
+                if (activeSocket !== sock || shuttingDown) throw new Error('socket_inactive');
+                return sock.updateProfilePicture(jid, image, dimensions);
+              },
+              imagePath: PROFILE_PICTURE_PATH,
+              expectedImageHash,
+              statePath: PROFILE_PICTURE_STATE_FILE,
+              requestPath: instancePaths.profileRequestFile,
+              logger: console,
+            };
+          },
         });
       }
       console.log('[WA] Connected');
@@ -490,6 +491,8 @@ console.log('──────────────────────�
 function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  activeProfilePicturePoller?.stop();
+  activeProfilePicturePoller = null;
   if (reconnectTimer) clearTimeout(reconnectTimer);
   reconnectTimer = null;
   if (reconnectStabilityTimer) clearTimeout(reconnectStabilityTimer);

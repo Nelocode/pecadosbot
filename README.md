@@ -1,4 +1,4 @@
-# Bot AutoReply Madrid
+# PecadosVIP — Bot AutoReply
 
 ## Pruebas sin servicios externos
 
@@ -26,9 +26,12 @@ La petición caduca en diez minutos. Un resultado incierto no se reintenta solo.
 Las aplicaciones confirmadas se deduplican por cuenta y logo. El estado muestra
 la última aplicación comprobada; no vigila cambios manuales posteriores del perfil.
 
-WhatsApp conserva la aplicación al abrir la conexión principal: los candidatos
-en modo `WA_LINK_ONLY` no cambian la foto. El estado se guarda por cuenta y hash
-del logo. Una confirmación significa que WhatsApp aceptó la operación; no es una
+WhatsApp solicita la foto únicamente después de promover y comprobar en línea
+una cuenta vinculada desde este panel. La petición identifica PecadosVIP, la
+cuenta y el hash del logo y caduca en diez minutos. Abrir una sesión existente
+no crea esa petición; los candidatos `WA_LINK_ONLY` tampoco cambian la foto.
+El estado se guarda por cuenta y hash del logo. Una confirmación significa que
+WhatsApp aceptó la operación; no es una
 comparación visual de la imagen remota. Una desconexión o tiempo de espera agotado
 se muestra como incierto y no provoca un reintento automático. Se conserva la
 espera por límites de WhatsApp.
@@ -48,6 +51,37 @@ No eliminar los archivos de estado para forzar reintentos: primero verificar el
 resultado remoto cuando el estado sea incierto. La comprobación final requiere
 una vinculación autorizada con cada proveedor; las pruebas locales usan clientes
 simulados y no cambian perfiles reales.
+
+## Separación de instancias y marcas
+
+Este repositorio corresponde a PecadosVIP. Sus defaults, portada de audio y
+logotipo de perfil pertenecen a esa marca. La portada JPEG deriva del PNG
+oficial existente; su procedencia está en `assets/README.md`. Las etiquetas y
+dos imágenes heredadas conocidas de Las Fiesteras no se reutilizan, incluso si
+permanecen en overrides. Otras personalizaciones se conservan.
+
+El panel fija las rutas del worker WhatsApp a su propio directorio de datos.
+El worker valida esas rutas antes de abrir la sesión: rechaza `BOT_DIR` de otro
+checkout, escapes de rutas y enlaces a carpetas externas. Telegram comprueba
+que la identidad real de la sesión coincida con el teléfono indicado, tanto al
+vincular como antes de procesar interacciones. El control de procesos comprueba
+el script y la instancia a la que pertenece un PID antes de detenerlo.
+El arranque del contenedor valida las rutas antes de copiar defaults o leer
+configuración persistente; los logs de los workers permanecen en el `data` de
+esa instancia, sin compartir nombres globales en `/tmp`.
+
+Estas comprobaciones no demuestran que los montajes de producción sean
+independientes. Cada instancia debe tener su propio directorio/volumen `data`,
+sesiones, configuración y procesos; copiar el mismo volumen entre marcas no es
+una forma de vincular cuentas. Tampoco se deduce la marca de una cuenta solo de
+su nombre público: el operador debe seleccionar la cuenta correcta al vincular.
+
+El único workflow versionado ejecuta pruebas. GitHub no contiene una definición
+de despliegue ni registros visibles que acrediten los montajes o servicios.
+`deploy.sh` es un script legado externo, con `/opt/bot-autoreply` y nombres
+systemd genéricos: no proporciona aislamiento entre marcas y no debe usarse
+para publicar esta revisión. Su reemplazo por una publicación específica de
+PecadosVIP requiere revisar el destino y autorizar ese alcance por separado.
 
 ## Vincular Telegram mediante QR
 
