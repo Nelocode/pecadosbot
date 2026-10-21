@@ -13,6 +13,8 @@ const EVENT_STATES = new Set([
 const OUTCOME_STATES = new Set(['handled', 'ignored', 'failed', 'never']);
 const REASONS = new Set([
   'completed',
+  'delivery_incomplete',
+  'delivery_uncertain',
   'non_offer',
   'invalid_event',
   'missing_identity',
@@ -24,6 +26,7 @@ const REASONS = new Set([
 const DELIVERY_STATES = new Set([
   'sent',
   'failed',
+  'uncertain',
   'missing',
   'skipped',
   'skipped_offline',
@@ -31,6 +34,7 @@ const DELIVERY_STATES = new Set([
   'never',
 ]);
 const PAYLOAD_STATES = new Set(['array', 'object', 'invalid', 'never']);
+const DELIVERY_SUMMARIES = new Set(['complete', 'partial', 'failed', 'uncertain', 'skipped', 'not_applicable', 'never']);
 const SIZE_STATES = new Set(['empty', 'one', 'multiple', 'never']);
 const TARGET_STATES = new Set(['caller_pn', 'chat_id', 'from', 'missing', 'not_applicable', 'never']);
 const TARGET_KIND_STATES = new Set(['pn', 'lid', 'other', 'missing', 'not_applicable', 'never']);
@@ -71,6 +75,8 @@ function initialState(idFactory) {
       reject: 'never',
       text: 'never',
       audio: 'never',
+      video_delivery: 'never',
+      delivery: 'never',
       target: 'never',
       target_kind: 'never',
     },
@@ -164,6 +170,8 @@ export function createWhatsAppCallHealth({
             reject: allowed(metric.reject, DELIVERY_STATES, 'not_applicable'),
             text: allowed(metric.text, DELIVERY_STATES, 'not_applicable'),
             audio: allowed(metric.audio, DELIVERY_STATES, 'not_applicable'),
+            video_delivery: allowed(metric.videoDelivery, DELIVERY_STATES, 'not_applicable'),
+            delivery: allowed(metric.delivery, DELIVERY_SUMMARIES, 'not_applicable'),
             target: allowed(metric.target, TARGET_STATES, 'not_applicable'),
             target_kind: allowed(metric.targetKind, TARGET_KIND_STATES, 'not_applicable'),
           };

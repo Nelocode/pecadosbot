@@ -188,59 +188,52 @@ export function createWhatsAppMessageHandler({
     }
 
     const text = typeof response.text === 'string' ? response.text.trim() : '';
-    if (text) {
+    const prepare = {
+      text: async () => ({ text }),
+      audio: async () => toWhatsAppAudioContent(await readAudio(response.audio)),
+      video: async () => toWhatsAppVideoContent(await readVideo(response.video)),
+    };
+    const configured = { text: Boolean(text), audio: Boolean(response.audio), video: Boolean(response.video) };
+    const order = configured.video ? ['video', 'text', 'audio'] : ['text', 'audio'];
+    for (const component of order) {
+      if (!configured[component]) continue;
+      let content;
+      try {
+        content = await prepare[component]();
+      } catch {
+        result[component] = 'failed';
+        logger.error?.(`[WA] ${component} preparation failed`);
+        continue;
+      }
+      if (!content) {
+        result[component] = 'missing';
+        continue;
+      }
       try {
         await settleWithTimeout(
-          Promise.resolve(sendMessage(jid, { text })),
+          Promise.resolve(sendMessage(jid, content)),
           sendTimeoutMs,
-          'El envío de texto de WhatsApp',
+          `El envío de ${component} de WhatsApp`,
         );
-        result.text = 'sent';
+        result[component] = 'sent';
       } catch {
-        result.text = 'failed';
-        logger.error?.('[WA] Text delivery failed');
+        // A timeout does not cancel Baileys. Keep the event claimed and never
+        // retry a component whose provider acknowledgement may have been lost.
+        result[component] = 'uncertain';
+        logger.error?.(`[WA] ${component} delivery unconfirmed`);
       }
     }
 
-    if (response.audio) {
-      try {
-        const audioContent = toWhatsAppAudioContent(await readAudio(response.audio));
-        if (audioContent) {
-          await settleWithTimeout(
-            Promise.resolve(sendMessage(jid, audioContent)),
-            sendTimeoutMs,
-            'El envío de audio de WhatsApp',
-          );
-          result.audio = 'sent';
-        } else {
-          result.audio = 'missing';
-        }
-      } catch {
-        result.audio = 'failed';
-        logger.error?.('[WA] Audio delivery failed');
-      }
+    const outcomes = [result.text, result.audio, result.video];
+    const incomplete = outcomes.some(outcome => ['failed', 'missing', 'uncertain'].includes(outcome));
+    result.delivery = outcomes.includes('uncertain') ? 'uncertain'
+      : incomplete ? (outcomes.includes('sent') ? 'partial' : 'failed')
+        : outcomes.includes('sent') ? 'complete' : 'skipped';
+    if (incomplete) {
+      result.status = 'failed';
+      result.reason = result.delivery === 'uncertain' ? 'delivery_uncertain' : 'delivery_incomplete';
     }
-
-    if (response.video) {
-      try {
-        const videoContent = toWhatsAppVideoContent(await readVideo(response.video));
-        if (videoContent) {
-          await settleWithTimeout(
-            Promise.resolve(sendMessage(jid, videoContent)),
-            sendTimeoutMs,
-            'El envío de video de WhatsApp',
-          );
-          result.video = 'sent';
-        } else {
-          result.video = 'missing';
-        }
-      } catch {
-        result.video = 'failed';
-        logger.error?.('[WA] Video delivery failed');
-      }
-    }
-
-    logger.info?.(`[WA] Response completed type=${decision.responseKey}`);
+    logger.info?.(`[WA] Response processed type=${decision.responseKey} delivery=${result.delivery}`);
     return result;
   }
 

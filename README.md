@@ -59,6 +59,24 @@ simulados y no cambian perfiles reales.
 
 ## Vídeos y audios opcionales en Telegram
 
+En la cuenta Telegram MTProto vinculada y en WhatsApp, las respuestas con vídeo
+configurado intentan los componentes en este orden: **vídeo → texto → audio**.
+Se espera el resultado del intento de vídeo antes de iniciar el texto. El audio
+opcional se conserva, pero no se antepone al vídeo. Sin vídeo, los pasos mantienen
+texto → audio y las llamadas audio → texto.
+
+Un vídeo ausente o un envío fallido no se presenta como entrega completa: se
+informa del fallo y se intentan los demás componentes configurados. Telegram
+conserva los identificadores por evento/componente al reintentar una entrega
+parcial. WhatsApp conserva la deduplicación del evento y no reintenta
+automáticamente envíos inciertos; procesar un evento no acredita su entrega.
+Si se agota el tiempo de espera sin confirmación del proveedor, el orden de los
+intentos queda controlado, pero no puede garantizarse el orden de llegada remoto.
+El diagnóstico de llamadas WhatsApp en `/api/wa_call_health` distingue el resumen
+`pipeline.delivery` y la entrega `pipeline.video_delivery` del indicador `video`
+de videollamada entrante. Este cambio cubre Telegram MTProto vinculado al panel;
+el bot opcional de BotFather conserva su flujo independiente.
+
 Un campo `audio: ""` omite el audio y permite enviar el texto y el vídeo del paso
 o llamada. Los campos ausentes o inválidos conservan sus valores predeterminados.
 No se borran nombres de audio existentes: si se configuró un archivo que falta,
