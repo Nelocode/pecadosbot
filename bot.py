@@ -79,6 +79,7 @@ PROFILE_PICTURE_PATH = Path(
 INTERACTION_STATE_FILE = DATA_DIR / "tg_interaction_state.json"
 INTERACTION_HEALTH_FILE = DATA_DIR / "tg_interaction_health.json"
 TELEGRAM_SEND_TIMEOUT_SECONDS = 20
+TELEGRAM_UPLOAD_TIMEOUT_SECONDS = 300
 TELEGRAM_SEND_RETRIES = 3
 TELEGRAM_CALL_REJECT_TIMEOUT_SECONDS = 6
 TELEGRAM_CALL_REJECT_SETTLE_SECONDS = 0.5
@@ -238,13 +239,18 @@ _uploaded_media_cache: dict[str, tuple[int, int, object]] = {}
 
 
 async def _upload_file_cached(file_path: Path) -> object:
+    if not telegram_identity_verified:
+        raise RuntimeError("Telegram account identity is not verified")
     key = str(file_path.resolve())
     stat = file_path.stat()
     signature = (stat.st_mtime_ns, stat.st_size)
     cached = _uploaded_media_cache.get(key)
     if cached is not None and cached[0] == signature[0] and cached[1] == signature[1]:
         return cached[2]
-    uploaded = await client.upload_file(str(file_path))
+    uploaded = await asyncio.wait_for(
+        client.upload_file(str(file_path)),
+        timeout=TELEGRAM_UPLOAD_TIMEOUT_SECONDS,
+    )
     if len(_uploaded_media_cache) >= 64:
         _uploaded_media_cache.clear()
     _uploaded_media_cache[key] = (signature[0], signature[1], uploaded)
@@ -365,21 +371,50 @@ async def heartbeat() -> None:
         await asyncio.sleep(15)
 
 
-async def _retry_telegram_operation(label: str, operation):
+async def _retry_telegram_operation(label: str, operation, *, prepare=None):
     last_error = None
+    component = label.replace("_delivery", "")
+    uncertain = False
     for attempt in range(1, TELEGRAM_SEND_RETRIES + 1):
         if not telegram_identity_verified:
+            raise RuntimeError("Telegram account identity is not verified")
+        if prepare is not None:
+            if not uncertain:
+                update_delivery_health(component, "uploading")
+            try:
+                # Uploads have their own budget; the RPC deadline starts afterwards.
+                await prepare()
+            except asyncio.CancelledError:
+                update_delivery_health(component, "uncertain" if uncertain else "failed")
+                raise
+            except Exception as exc:
+                update_delivery_health(component, "uncertain" if uncertain else "failed")
+                raise RuntimeError(f"telegram_{component}_upload_failed") from exc
+        # A long upload may have outlived this connection's verified identity.
+        if not telegram_identity_verified:
+            update_delivery_health(component, "uncertain" if uncertain else "failed")
             raise RuntimeError("Telegram account identity is not verified")
         try:
             result = await asyncio.wait_for(
                 operation(),
                 timeout=TELEGRAM_SEND_TIMEOUT_SECONDS,
             )
-            update_delivery_health(label.replace("_delivery", ""), "sent")
+            update_delivery_health(component, "sent")
             return result
+        except asyncio.CancelledError:
+            if label.endswith("_delivery"):
+                update_delivery_health(component, "uncertain")
+            raise
         except Exception as exc:
             last_error = exc
-            update_delivery_health(label.replace("_delivery", ""), "failed")
+            # Only an explicit RPC rejection proves the request was rejected.
+            # Network errors and exhausted SDK retries may lose the acknowledgement.
+            if label.endswith("_delivery") and (
+                not isinstance(exc, errors.RPCError)
+                or isinstance(exc, (errors.TimedOutError, errors.ServerError))
+            ):
+                uncertain = True
+            update_delivery_health(component, "uncertain" if uncertain else "failed")
             logging.warning(
                 "Telegram %s attempt %s/%s failed (%s)",
                 label,
@@ -446,10 +481,15 @@ async def send_response(
             settings_path=AUDIO_BRANDING_SETTINGS_FILE,
         )
 
-        async def send_audio_media():
-            uploaded_file = await _upload_file_cached(audio_path)
-            uploaded_thumb = None
-            if AUDIO_COVER_PATH.is_file():
+        uploaded_file = None
+        uploaded_thumb = None
+        cover_prepared = False
+
+        async def prepare_audio_media():
+            nonlocal uploaded_file, uploaded_thumb, cover_prepared
+            if uploaded_file is None:
+                uploaded_file = await _upload_file_cached(audio_path)
+            if not cover_prepared and AUDIO_COVER_PATH.is_file():
                 try:
                     uploaded_thumb = await _upload_file_cached(AUDIO_COVER_PATH)
                 except (OSError, errors.RPCError) as exc:
@@ -458,7 +498,10 @@ async def send_response(
                         "Telegram audio cover upload failed (%s); sending without it",
                         type(exc).__name__,
                     )
+            cover_prepared = True
 
+        async def send_audio_media():
+            nonlocal uploaded_file, uploaded_thumb
             def media_request(thumb):
                 media = build_branded_audio_media(
                     uploaded_file=uploaded_file,
@@ -475,20 +518,34 @@ async def send_response(
 
             try:
                 return await client(media_request(uploaded_thumb))
+            except (errors.TimedOutError, errors.ServerError):
+                raise
             except errors.RPCError as exc:
-                _evict_upload_cache(audio_path)
                 if uploaded_thumb is None:
+                    _evict_upload_cache(audio_path)
+                    uploaded_file = None
                     raise
                 _evict_upload_cache(AUDIO_COVER_PATH)
+                uploaded_thumb = None
                 logging.warning(
                     "Telegram rejected the audio cover (%s); retrying without it",
                     type(exc).__name__,
                 )
-                return await client(media_request(None))
+                if not telegram_identity_verified:
+                    raise RuntimeError("Telegram account identity is not verified")
+                try:
+                    return await client(media_request(None))
+                except (errors.TimedOutError, errors.ServerError):
+                    raise
+                except errors.RPCError:
+                    _evict_upload_cache(audio_path)
+                    uploaded_file = None
+                    raise
 
         await _retry_telegram_operation(
             "audio_delivery",
             send_audio_media,
+            prepare=prepare_audio_media,
         )
 
     async def send_video_message():
@@ -505,8 +562,15 @@ async def send_response(
             supports_streaming=True,
         )
 
+        uploaded_file = None
+
+        async def prepare_video_media():
+            nonlocal uploaded_file
+            if uploaded_file is None:
+                uploaded_file = await _upload_file_cached(video_path)
+
         async def send_video_media():
-            uploaded_file = await _upload_file_cached(video_path)
+            nonlocal uploaded_file
             media = types.InputMediaUploadedDocument(
                 file=uploaded_file,
                 mime_type=video_mime_type or "video/mp4",
@@ -522,13 +586,17 @@ async def send_response(
             )
             try:
                 return await client(request)
+            except (errors.TimedOutError, errors.ServerError):
+                raise
             except errors.RPCError:
                 _evict_upload_cache(video_path)
+                uploaded_file = None
                 raise
 
         await _retry_telegram_operation(
             "video_delivery",
             send_video_media,
+            prepare=prepare_video_media,
         )
 
     await deliver_telegram_response_components(

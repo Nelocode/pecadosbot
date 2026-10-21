@@ -34,6 +34,15 @@ class WhatsAppProfilePhotoStatusTests(unittest.TestCase):
         return whatsapp_profile_picture_status(self.identity, self.state, image or self.official,
                                                self.official, **kwargs)
 
+    def request(self, **overrides):
+        now = int(time.time() * 1000)
+        request = {"brand": "pecadosvip", "status": "pending", "requestId": "2" * 32,
+                   "accountHash": self.account, "imageHash": self.image_hash,
+                   "requestedAt": now, "expiresAt": now + 600_000}
+        request.update(overrides)
+        (self.root / "wa_profile_picture_request.json").write_text(json.dumps(request), encoding="utf-8")
+        return request
+
     def assert_safe(self, status):
         self.assertLessEqual(set(status), {"status", "message", "verification"})
         encoded = json.dumps(status)
@@ -45,6 +54,7 @@ class WhatsAppProfilePhotoStatusTests(unittest.TestCase):
         status = self.status()
         self.assertEqual("applied", status["status"])
         self.assertEqual("provider_acknowledged", status["verification"])
+        self.assertIn("última actualización registrada", status["message"])
         self.assert_safe(status)
 
     def test_applied_record_without_provider_acknowledgement_is_not_confirmation(self):
@@ -125,6 +135,90 @@ class WhatsAppProfilePhotoStatusTests(unittest.TestCase):
                     status = self.status()
                     self.assertEqual("uncertain", status["status"])
                     self.assert_safe(status)
+
+    def test_new_link_request_is_pending_instead_of_reusing_a_historical_result(self):
+        self.request()
+        for old_status in ("applied", "failed", "missing"):
+            for request_id in (None, "1" * 32):
+                with self.subTest(old_status=old_status, request_id=request_id):
+                    self.record(status=old_status, requestId=request_id)
+                    status = self.status()
+                    self.assertEqual("pending", status["status"])
+                    self.assertNotIn("verification", status)
+                    self.assert_safe(status)
+
+    def test_expired_or_invalid_new_request_is_not_hidden_by_an_old_ack(self):
+        self.record(requestId="1" * 32)
+        now = int(time.time() * 1000)
+        for fields in ({"requestedAt": now - 700_000, "expiresAt": now - 100_000},
+                       {"brand": "las-fiesteras"}, {"imageHash": "f" * 64}, {"requestId": "invalid"}):
+            with self.subTest(fields=fields):
+                self.request(**fields)
+                status = self.status()
+                self.assertEqual("failed", status["status"])
+                self.assertNotIn("verification", status)
+                self.assert_safe(status)
+
+    def test_current_request_outcome_remains_visible_after_its_authorization_expires(self):
+        now = int(time.time() * 1000)
+        request = self.request(requestedAt=now - 700_000, expiresAt=now - 100_000)
+        for outcome in ("applied", "failed", "uncertain"):
+            with self.subTest(outcome=outcome):
+                self.record(requestId=request["requestId"], status=outcome)
+                self.assertEqual(outcome, self.status()["status"])
+
+    def test_new_request_cannot_hide_an_unresolved_operation_even_for_an_old_image(self):
+        self.request()
+        for image_hash in (self.image_hash, "f" * 64):
+            for old_status in ("pending", "uncertain"):
+                with self.subTest(image_hash=image_hash, old_status=old_status):
+                    self.record(requestId="1" * 32, imageHash=image_hash, status=old_status,
+                                attemptedAt=time.time() * 1000 - 100_000)
+                    status = self.status()
+                    self.assertEqual("uncertain", status["status"])
+                    self.assert_safe(status)
+
+    def test_new_request_preserves_visible_cooldown_then_becomes_pending_after_wait(self):
+        with patch("profile_photo_status.time.time", return_value=1000):
+            self.request()
+            for image_hash in (self.image_hash, "f" * 64):
+                with self.subTest(image_hash=image_hash):
+                    self.record(requestId="1" * 32, imageHash=image_hash, status="failed",
+                                errorCode="rate_limited", retryAfter=1_001_000)
+                    status = self.status()
+                    self.assertEqual("failed", status["status"])
+                    self.assertIn("limitó", status["message"])
+                    self.assert_safe(status)
+            with patch("profile_photo_status.time.time", return_value=1002):
+                self.assertEqual("pending", self.status()["status"])
+
+    def test_request_for_another_account_does_not_replace_current_account_status(self):
+        self.record(requestId="1" * 32)
+        self.request(accountHash="b" * 64)
+        status = self.status()
+        self.assertEqual("applied", status["status"])
+        self.assert_safe(status)
+
+    def test_unreadable_or_malformed_request_cannot_reuse_historical_success(self):
+        self.record(requestId="1" * 32)
+        request_path = self.root / "wa_profile_picture_request.json"
+        for contents in ("invalid JSON", "[]", "null", "{}", '{"accountHash": "invalid"}'):
+            with self.subTest(contents=contents):
+                request_path.write_text(contents, encoding="utf-8")
+                status = self.status()
+                self.assertEqual("failed", status["status"])
+                self.assert_safe(status)
+        original_read = Path.read_text
+
+        def read(path, *args, **kwargs):
+            if path == request_path:
+                raise PermissionError("private filesystem detail")
+            return original_read(path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", read):
+            self.assertEqual("failed", self.status()["status"])
+        request_path.unlink()
+        self.assertEqual("applied", self.status()["status"])
 
 
 if __name__ == "__main__":

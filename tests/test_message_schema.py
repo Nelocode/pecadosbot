@@ -1,3 +1,4 @@
+from copy import deepcopy
 import json
 from pathlib import Path
 import tempfile
@@ -77,13 +78,67 @@ class MessageSchemaTests(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertEqual("personalizado", normalized["es"]["steps"][0]["text"])
-        self.assertEqual("1.mp3", normalized["es"]["steps"][0]["audio"])
+        self.assertEqual("", normalized["es"]["steps"][0]["audio"])
         self.assertEqual("dos", normalized["es"]["steps"][1]["text"])
         self.assertEqual("custom.mp3", normalized["es"]["steps"][1]["audio"])
         self.assertEqual("llamada", normalized["es"]["call"]["text"])
         self.assertEqual("custom-call.mp3", normalized["es"]["call"]["audio"])
         self.assertEqual("", normalized["es"]["steps"][0]["video"])
         self.assertEqual("", normalized["es"]["call"]["video"])
+
+    def test_preserves_explicit_empty_audio_for_both_steps_and_call(self):
+        live = deepcopy(DEFAULTS)
+        for response in (*live["es"]["steps"], live["es"]["call"]):
+            response["audio"] = ""
+            response["video"] = "configured.mp4"
+
+        normalized, changed = normalize_message_schema(live, DEFAULTS)
+
+        self.assertFalse(changed)
+        self.assertEqual(live, normalized)
+        # The source configuration and named defaults are never rewritten in place.
+        self.assertEqual("1.mp3", DEFAULTS["es"]["steps"][0]["audio"])
+        self.assertEqual("call.mp3", DEFAULTS["es"]["call"]["audio"])
+
+    def test_missing_null_invalid_and_whitespace_audio_keep_legacy_defaults(self):
+        missing = object()
+        for value in (missing, None, False, 12, [], {}, " \t "):
+            with self.subTest(value=value):
+                live = deepcopy(DEFAULTS)
+                for response in (*live["es"]["steps"], live["es"]["call"]):
+                    if value is missing:
+                        response.pop("audio")
+                    else:
+                        response["audio"] = value
+
+                normalized, changed = normalize_message_schema(live, DEFAULTS)
+
+                self.assertTrue(changed)
+                self.assertEqual("1.mp3", normalized["es"]["steps"][0]["audio"])
+                self.assertEqual("2.mp3", normalized["es"]["steps"][1]["audio"])
+                self.assertEqual("call.mp3", normalized["es"]["call"]["audio"])
+
+    def test_persisted_migration_keeps_empty_and_named_audio_on_repeated_reads(self):
+        live = deepcopy(DEFAULTS)
+        live["es"]["steps"][0]["audio"] = ""
+        live["es"]["steps"][0]["video"] = "configured.mp4"
+        live["es"]["call"]["audio"] = ""
+        with tempfile.TemporaryDirectory() as directory:
+            messages_path = Path(directory) / "messages.json"
+            defaults_path = Path(directory) / "defaults.json"
+            messages_path.write_text(json.dumps(live), encoding="utf-8")
+            defaults_path.write_text(json.dumps(DEFAULTS), encoding="utf-8")
+
+            first = load_message_file(messages_path, defaults_path, persist=True)
+            saved = messages_path.read_bytes()
+            second = load_message_file(messages_path, defaults_path, persist=True)
+
+            self.assertEqual(first, second)
+            self.assertEqual(saved, messages_path.read_bytes())
+            self.assertEqual("", second["es"]["steps"][0]["audio"])
+            self.assertEqual("2.mp3", second["es"]["steps"][1]["audio"])
+            self.assertEqual("", second["es"]["call"]["audio"])
+            self.assertEqual(DEFAULTS, json.loads(defaults_path.read_text(encoding="utf-8")))
 
     def test_preserves_personalized_video_fields_and_adds_empty_default(self):
         live = {

@@ -46,8 +46,8 @@ class TelegramProfilePictureTests(unittest.IsolatedAsyncioTestCase):
         self.photo_request.start()
         self.addCleanup(self.photo_request.stop)
 
-    def queue(self, phone=PHONE):
-        return pictures.request_profile_picture(self.data, phone, self.image)
+    def queue(self, phone=PHONE, *, new_link=False):
+        return pictures.request_profile_picture(self.data, phone, self.image, new_link=new_link)
 
     def read_request(self):
         return json.loads((self.data / pictures.REQUEST_FILE).read_text(encoding="utf-8"))
@@ -79,8 +79,81 @@ class TelegramProfilePictureTests(unittest.IsolatedAsyncioTestCase):
         self.client.upload_file.assert_not_awaited()
         self.assertFalse(self.data.exists())
 
+    async def test_explicit_new_link_reapplies_after_external_photo_change(self):
+        self.queue()
+        self.assertEqual((await self.process())["status"], "applied")
+        old_request = self.read_request()
+        self.client.get_profile_photos.return_value = [SimpleNamespace(id=99)]
+
+        self.assertEqual(self.queue(new_link=True)["status"], "pending")
+        new_request = self.read_request()
+        self.assertNotEqual(old_request["request_id"], new_request["request_id"])
+        self.assertEqual(pictures.public_profile_picture_status(self.data, PHONE, self.image)["status"], "pending")
+        for new_link in (False, True):
+            self.assertEqual(self.queue(new_link=new_link)["status"], "pending")
+            self.assertEqual(self.read_request()["request_id"], new_request["request_id"])
+
+        async def apply_new_photo(request):
+            self.client.get_profile_photos.return_value = [SimpleNamespace(id=43)]
+            return SimpleNamespace(photo=SimpleNamespace(id=43))
+
+        self.client.apply.side_effect = apply_new_photo
+        self.assertEqual((await self.process())["status"], "applied")
+        self.assertEqual(self.client.upload_file.await_count, 2)
+        self.assertEqual(self.client.apply.await_count, 2)
+        self.assertEqual(self.client.get_profile_photos.await_count, 2)
+        # A reconnect consumes the same durable request, without applying again.
+        self.assertEqual((await self.process())["status"], "applied")
+        self.assertEqual(self.client.apply.await_count, 2)
+
+    async def test_current_failure_is_not_hidden_by_historical_success(self):
+        self.queue()
+        await self.process()
+        self.queue(new_link=True)
+        request = self.read_request()
+        self.client.upload_file.side_effect = RuntimeError("upload rejected")
+        self.assertEqual((await self.process())["status"], "failed")
+        self.assertEqual(pictures.public_profile_picture_status(self.data, PHONE, self.image)["status"], "failed")
+        self.assertEqual(self.queue()["status"], "failed")
+        self.assertEqual(self.read_request()["request_id"], request["request_id"])
+        await self.process()
+        self.assertEqual(self.client.upload_file.await_count, 2)
+        self.client.apply.assert_awaited_once()
+
+        # Another verified link can retry a known pre-application failure.
+        self.assertEqual(self.queue(new_link=True)["status"], "pending")
+        self.assertNotEqual(self.read_request()["request_id"], request["request_id"])
+
+    async def test_current_expiry_is_not_hidden_or_renewed_by_historical_success(self):
+        self.queue()
+        await self.process()
+        self.queue(new_link=True)
+        request = self.read_request()
+        with patch.object(pictures.time, "time", return_value=request["requested_at"] + 601):
+            status = pictures.public_profile_picture_status(self.data, PHONE, self.image)
+            self.assertEqual(status["status"], "failed")
+            self.assertEqual(status["message"], pictures._MESSAGES["expired"])
+            self.assertEqual(self.queue()["status"], "failed")
+            self.assertEqual(self.read_request()["request_id"], request["request_id"])
+            self.assertEqual((await self.process())["status"], "failed")
+        self.client.upload_file.assert_awaited_once()
+        self.client.apply.assert_awaited_once()
+
+    async def test_new_link_verification_failure_cannot_reuse_old_success(self):
+        self.queue()
+        await self.process()
+        self.queue(new_link=True)
+        request = self.read_request()
+        self.client.get_profile_photos.return_value = [SimpleNamespace(id=99)]
+        self.assertEqual((await self.process())["status"], "unverified")
+        self.assertEqual(pictures.public_profile_picture_status(self.data, PHONE, self.image)["status"], "unverified")
+        self.assertEqual(self.queue(new_link=True)["status"], "unverified")
+        self.assertEqual(self.read_request()["request_id"], request["request_id"])
+        await self.process()
+        self.assertEqual(self.client.apply.await_count, 2)
+
     async def test_wrong_account_does_not_consume_request(self):
-        self.queue(OTHER_PHONE)
+        self.queue(OTHER_PHONE, new_link=True)
         self.assertEqual((await self.process())["status"], "not_requested")
         self.assertFalse(self.result_path().exists())
         self.client.upload_file.assert_not_awaited()
@@ -120,8 +193,10 @@ class TelegramProfilePictureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.process(timeout_seconds=0.01))["status"], "unverified")
         self.assertEqual((await self.process())["status"], "unverified")
         self.assertEqual(self.queue()["status"], "unverified")
+        self.assertEqual(self.queue(new_link=True)["status"], "unverified")
         self.queue(OTHER_PHONE)
         self.assertEqual(self.queue()["status"], "unverified")
+        self.assertEqual(self.queue(new_link=True)["status"], "unverified")
         self.assertEqual(pictures.public_profile_picture_status(self.data, PHONE, self.image)["status"], "unverified")
         self.assertEqual(pictures.public_profile_picture_status(self.data, OTHER_PHONE, self.image)["status"], "pending")
         self.client.apply.assert_awaited_once()
@@ -221,6 +296,9 @@ class TelegramProfilePictureTests(unittest.IsolatedAsyncioTestCase):
         self.client.upload_file.side_effect = blocked_upload
         first = asyncio.create_task(self.process())
         await started.wait()
+        request = self.read_request()
+        self.assertEqual(self.queue(new_link=True)["status"], "applying")
+        self.assertEqual(self.read_request()["request_id"], request["request_id"])
         self.assertEqual((await self.process())["status"], "applying")
         proceed.set()
         self.assertEqual((await first)["status"], "applied")

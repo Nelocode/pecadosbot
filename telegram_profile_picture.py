@@ -171,11 +171,10 @@ def public_profile_picture_status(data_dir, phone, image_path):
         image_hash = hashlib.sha256(_image_bytes(image_path)).hexdigest()
     except (OSError, ValueError):
         return _public("failed", "image_unavailable")
-    applied = _applied_status(data_dir, account_hash, image_hash)
-    if applied:
-        return applied
     if not result_path:
-        return _public("not_requested")
+        return _applied_status(data_dir, account_hash, image_hash) or _public("not_requested")
+    # A new explicit link can supersede an old successful application. Report
+    # this request's progress/failure, never that account's historical success.
     if request["image_hash"] != image_hash:
         return _public("failed", "image_changed")
     if result_path.exists():
@@ -214,8 +213,12 @@ def _queue_lock(data_dir):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def request_profile_picture(data_dir, phone, image_path):
-    """Queue branding only after the panel has completed a successful account link."""
+def request_profile_picture(data_dir, phone, image_path, *, new_link=False):
+    """Queue branding after verified linking; only a new link replaces old success.
+
+    ``new_link`` denotes a newly completed, explicit account-link operation, not
+    worker startup or recovery. Pending/uncertain requests remain protected.
+    """
     if not _enabled():
         return _public("disabled")
     if not _account_hash(phone):
@@ -223,14 +226,14 @@ def request_profile_picture(data_dir, phone, image_path):
     try:
         _image_bytes(image_path)
         with _queue_lock(data_dir):
-            return _request_profile_picture_locked(data_dir, phone, image_path)
+            return _request_profile_picture_locked(data_dir, phone, image_path, new_link=new_link)
     except ValueError:
         return _public("failed", "image_unavailable")
     except OSError:
         return _public("failed", "storage_failed")
 
 
-def _request_profile_picture_locked(data_dir, phone, image_path):
+def _request_profile_picture_locked(data_dir, phone, image_path, *, new_link=False):
     account_hash = _account_hash(phone)
     if not account_hash:
         return _public("failed", "invalid_account")
@@ -243,9 +246,6 @@ def _request_profile_picture_locked(data_dir, phone, image_path):
     unresolved = _unresolved_status(data_dir, account_hash)
     if unresolved:
         return unresolved
-    applied = _applied_status(data_dir, account_hash, image_hash)
-    if applied:
-        return applied
     if previous and previous["account_hash"] == account_hash:
         previous_result = _result_path(data_dir, previous)
         if previous_result.exists():
@@ -254,8 +254,16 @@ def _request_profile_picture_locked(data_dir, phone, image_path):
             # even if the asset changed in the meantime.
             if status["status"] in {"applying", "unverified"}:
                 return status
+            if not new_link and previous["image_hash"] == image_hash:
+                return status
         elif previous["image_hash"] == image_hash and 0 <= time.time() - previous["requested_at"] <= REQUEST_TTL_SECONDS:
             return _public("pending", updated_at=previous["requested_at"])
+        elif not new_link and previous["image_hash"] == image_hash:
+            return _public("failed", "expired", previous["requested_at"])
+    if not new_link:
+        applied = _applied_status(data_dir, account_hash, image_hash)
+        if applied:
+            return applied
     request = {
         "request_id": uuid.uuid4().hex,
         "account_hash": account_hash,

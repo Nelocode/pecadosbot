@@ -103,6 +103,9 @@ def normalize_message_schema(messages: object, defaults: object) -> tuple[dict, 
                 changed = True
             for field in ("text", "audio"):
                 current_value = steps[index].get(field)
+                # An explicit empty audio disables that component; it is not a missing field.
+                if field == "audio" and current_value == "":
+                    continue
                 if not isinstance(current_value, str) or not current_value.strip():
                     default_value = default_step.get(field)
                     if not isinstance(default_value, str) or not default_value.strip():
@@ -140,6 +143,8 @@ def normalize_message_schema(messages: object, defaults: object) -> tuple[dict, 
         call = language_data["call"]
         for field in ("text", "audio"):
             current_value = call.get(field)
+            if field == "audio" and current_value == "":
+                continue
             if not isinstance(current_value, str) or not current_value.strip():
                 default_value = default_call.get(field)
                 if not isinstance(default_value, str) or not default_value.strip():

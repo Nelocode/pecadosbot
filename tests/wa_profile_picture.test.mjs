@@ -171,6 +171,92 @@ test('a newly approved official asset is applied again', async t => {
   assert.equal(calls, 2);
 });
 
+test('a new link request reapplies the same logo once and subsequent reconnects reuse only that request', async t => {
+  const files = fixture(t);
+  let calls = 0;
+  let clock = 1_000;
+  const options = { ...files.options, now: () => clock, updateProfilePicture: async () => { calls += 1; } };
+  assert.equal((await applyWhatsAppProfilePicture(options)).status, 'applied');
+  const firstRequest = files.read().requestId;
+  clock = 2_000;
+  const nextRequest = files.queue(JID, options.expectedImageHash, clock);
+  assert.notEqual(nextRequest.requestId, firstRequest);
+  assert.equal((await applyWhatsAppProfilePicture(options)).status, 'applied');
+  assert.equal(files.read().requestId, nextRequest.requestId);
+  assert.equal(files.read().appliedAt, clock);
+  assert.equal((await applyWhatsAppProfilePicture({ ...options, jid: '573001234567:9@s.whatsapp.net' })).status, 'unchanged');
+  assert.equal(calls, 2);
+  fs.rmSync(files.requestPath);
+  assert.equal((await applyWhatsAppProfilePicture(options)).status, 'not_requested');
+  assert.equal(calls, 2);
+});
+
+test('legacy ACK without request identity cannot suppress a fresh link request', async t => {
+  const files = fixture(t);
+  fs.writeFileSync(files.statePath, JSON.stringify({ version: 1, accounts: {
+    [whatsappProfileAccountHash(JID)]: { status: 'applied', imageHash: files.options.expectedImageHash,
+      appliedAt: 500, verification: 'provider_acknowledged' },
+  } }));
+  let calls = 0;
+  assert.equal((await applyWhatsAppProfilePicture({ ...files.options,
+    updateProfilePicture: async () => { calls += 1; },
+  })).status, 'applied');
+  assert.equal(calls, 1);
+  assert.equal(files.read().requestId, JSON.parse(fs.readFileSync(files.requestPath, 'utf8')).requestId);
+});
+
+test('another account request cannot reapply or replace this account historical ACK', async t => {
+  const files = fixture(t);
+  let calls = 0;
+  const options = { ...files.options, updateProfilePicture: async () => { calls += 1; } };
+  await applyWhatsAppProfilePicture(options);
+  const previous = files.read();
+  files.queue('573000000000@s.whatsapp.net');
+  assert.equal((await applyWhatsAppProfilePicture(options)).status, 'not_requested');
+  assert.equal(calls, 1);
+  assert.deepEqual(files.read(), previous);
+});
+
+test('fresh link requests preserve cooldown and need a fresh request after it ends', async t => {
+  const files = fixture(t);
+  let calls = 0;
+  let clock = 1_000;
+  const options = { ...files.options, now: () => clock, updateProfilePicture: async () => {
+    calls += 1;
+    if (calls === 1) throw Object.assign(new Error('rejected'), { data: 403 });
+  } };
+  assert.equal((await applyWhatsAppProfilePicture(options)).status, 'failed');
+  const previous = files.read();
+  clock = 2_000;
+  files.queue(JID, options.expectedImageHash, clock);
+  assert.equal((await applyWhatsAppProfilePicture(options)).status, 'cooldown');
+  assert.deepEqual(files.read(), previous);
+  clock = previous.retryAfter + 1;
+  assert.equal((await applyWhatsAppProfilePicture(options)).errorCode, 'request_expired');
+  assert.equal(calls, 1);
+  const fresh = files.queue(JID, options.expectedImageHash, clock);
+  assert.equal((await applyWhatsAppProfilePicture(options)).status, 'applied');
+  assert.equal(calls, 2);
+  assert.equal(files.read().requestId, fresh.requestId);
+});
+
+test('fresh same-logo requests cannot retry an unresolved account operation', async t => {
+  const files = fixture(t);
+  let calls = 0;
+  for (const previousStatus of ['pending', 'uncertain']) {
+    fs.writeFileSync(files.statePath, JSON.stringify({ version: 1, accounts: {
+      [whatsappProfileAccountHash(JID)]: { status: previousStatus, requestId: 'a'.repeat(32),
+        imageHash: files.options.expectedImageHash, attemptedAt: 500, errorCode: 'update_unconfirmed' },
+    } }));
+    files.queue();
+    assert.equal((await applyWhatsAppProfilePicture({ ...files.options,
+      updateProfilePicture: async () => { calls += 1; },
+    })).status, 'uncertain');
+    assert.equal(files.read().requestId, 'a'.repeat(32));
+  }
+  assert.equal(calls, 0);
+});
+
 test('a different override is blocked even when it was applied by old code', async t => {
   const files = fixture(t);
   const oldImage = Buffer.from('legacy-other-brand');
