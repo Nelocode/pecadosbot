@@ -19,6 +19,7 @@ import { classifyWhatsAppDisconnect } from './wa_disconnect_policy.mjs';
 import { createWhatsAppVoiceNoteReader, createWhatsAppVideoReader } from './wa_audio_delivery.mjs';
 import { pollWhatsAppProfilePicture, whatsappProfileAccountHash } from './wa_profile_picture.mjs';
 import { createWhatsAppSafetyHealth } from './wa_safety_health.mjs';
+import { createWhatsAppDeliveryTiming } from './wa_delivery_timing.mjs';
 import {
   createWhatsAppDeliverySafety,
   readWhatsAppSafetyConfig,
@@ -54,6 +55,10 @@ const DEFAULT_LANGUAGE = /^[a-z]{2,5}$/.test(configuredDefaultLanguage)
   : 'es';
 const callHealth = createWhatsAppCallHealth({ filePath: CALL_HEALTH_FILE, logger: console });
 const safetyConfig = readWhatsAppSafetyConfig();
+const deliveryTiming = LINK_ONLY ? null : createWhatsAppDeliveryTiming({
+  filePath: path.join(DATA_DIR, 'wa_delivery_timing.json'),
+  logger: console,
+});
 const safetyHealth = LINK_ONLY ? null : createWhatsAppSafetyHealth({
   filePath: SAFETY_HEALTH_FILE,
   controlFilePath: SAFETY_CONTROL_FILE,
@@ -295,6 +300,7 @@ async function startBot() {
     sendPresenceUpdate: (presence, jid) => sock.sendPresenceUpdate(presence, jid),
     readMessages: keys => sock.readMessages(keys),
     health: safetyHealth,
+    timing: deliveryTiming,
     config: safetyConfig,
     logger: console,
   });
@@ -328,7 +334,7 @@ async function startBot() {
     // Register immediately: call events are not buffered by Baileys.
     const handleCallBatch = createWhatsAppCallHandler({
       rejectCall: (callId, callFrom) => sock.rejectCall(callId, callFrom),
-      sendMessage: (jid, content) => deliverySafety.send(jid, content),
+      sendMessage: (jid, content, metadata) => deliverySafety.send(jid, content, metadata),
       deliveryAllowed: () => deliverySafety.canDeliver(),
       getCallMessage,
       getResponseMessage,
@@ -458,7 +464,7 @@ async function startBot() {
     // Un único manejador cuenta texto y cualquier multimedia en el mismo estado
     // que las llamadas. Los eventos de sincronización y control se descartan.
     const handleMessageBatch = createWhatsAppMessageHandler({
-      sendMessage: (jid, content) => deliverySafety.send(jid, content),
+      sendMessage: (jid, content, metadata) => deliverySafety.send(jid, content, metadata),
       markRead: messageKey => deliverySafety.markRead(messageKey),
       deliveryAllowed: () => deliverySafety.canDeliver(),
       routeInteraction: details => interactionState.register(details),

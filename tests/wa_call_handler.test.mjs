@@ -591,8 +591,40 @@ function videoFirstCallHarness(t, overrides = {}) {
       ...overrides,
     });
   };
-  return { handler: create(), create, effects, metrics };
+  return { handler: create(), create, effects, metrics, statePath };
 }
+
+test('call with an unpersisted claim never reads or sends media, including after recreation', async t => {
+  const effects = [];
+  const files = videoFirstCallHarness(t, {
+    readVideo: async () => { effects.push('read_video'); return Buffer.from('video'); },
+    sendMessage: async () => effects.push('send'),
+  });
+  fs.mkdirSync(files.statePath);
+  for (const handler of [files.handler, files.create()]) {
+    const [result] = await handler([offer({ id: 'unpersisted-video' })]);
+    assert.equal(result.status, 'failed');
+    assert.equal(result.reason, 'interaction_state_failed');
+  }
+  assert.deepEqual(effects, []);
+  assert.equal(files.metrics.filter(value => value.reason === 'interaction_state_failed').length, 2);
+});
+
+test('call components share an opaque timing trace and a new call gets a new trace', async t => {
+  const contexts = [];
+  const files = videoFirstCallHarness(t, {
+    sendMessage: async (_jid, _content, context) => contexts.push(context),
+  });
+  await files.handler([offer({ id: 'trace-call1' })]);
+  await files.handler([offer({ id: 'trace-call2' })]);
+  assert.equal(contexts.length, 6);
+  assert.match(contexts[0].trace_id, /^[0-9a-f-]{36}$/i);
+  assert.equal(new Set(contexts.slice(0, 3).map(value => value.trace_id)).size, 1);
+  assert.equal(new Set(contexts.slice(3).map(value => value.trace_id)).size, 1);
+  assert.notEqual(contexts[0].trace_id, contexts[3].trace_id);
+  assert.ok(contexts.every(value => value.response === 'call'));
+  assert.deepEqual(Object.keys(contexts[0]).sort(), ['response', 'trace_id']);
+});
 
 test('call waits for video acknowledgement before text and audio', async t => {
   const effects = [];
@@ -665,11 +697,15 @@ test('call response preparation failure is reported without claiming delivery su
   assert.deepEqual(files.effects, []);
 });
 
-for (const failure of ['missing', 'read_error', 'send_error', 'timeout']) {
-  test(`call video ${failure} preserves fallback order, truthful metrics and persistent deduplication`, async t => {
+for (const failure of ['missing', 'read_error', 'send_error', 'timeout', 'timeout_late_error', 'cancelled']) {
+  test(`call video ${failure} stops uncertain delivery and preserves persistent deduplication`, async t => {
     const effects = [];
     let releaseLateVideo;
-    const lateVideo = new Promise(resolve => { releaseLateVideo = resolve; });
+    let rejectLateVideo;
+    const lateVideo = new Promise((resolve, reject) => {
+      releaseLateVideo = resolve;
+      rejectLateVideo = reject;
+    });
     const files = videoFirstCallHarness(t, {
       sendTimeoutMs: 10,
       readVideo: async () => {
@@ -678,34 +714,51 @@ for (const failure of ['missing', 'read_error', 'send_error', 'timeout']) {
         if (failure === 'read_error') throw new Error('synthetic read failure');
         return Buffer.from('video');
       },
+      readAudio: async () => {
+        effects.push('read_audio');
+        return Buffer.from('audio');
+      },
       sendMessage: async (_jid, content) => {
         const component = content.video ? 'video' : content.text ? 'text' : 'audio';
         effects.push(component);
         if (component === 'video' && failure === 'send_error') throw new Error('lost acknowledgement');
-        if (component === 'video' && failure === 'timeout') await lateVideo;
+        if (component === 'video' && failure.startsWith('timeout')) await lateVideo;
+        if (component === 'video' && failure === 'cancelled') {
+          await new Promise((_, reject) => setImmediate(() => {
+            reject(new DOMException('Synthetic send cancelled', 'AbortError'));
+          }));
+        }
       },
     });
     const event = offer({ id: `video-${failure}` });
     const [result] = await files.handler([event]);
-    const uncertain = ['send_error', 'timeout'].includes(failure);
+    const uncertain = !['missing', 'read_error'].includes(failure);
     assert.equal(result.video, uncertain ? 'uncertain' : failure === 'missing' ? 'missing' : 'failed');
     assert.equal(result.status, 'failed');
     assert.equal(result.delivery, uncertain ? 'uncertain' : 'partial');
-    assert.equal(result.text, 'sent');
-    assert.equal(result.audio, 'sent');
-    assert.deepEqual(effects, uncertain ? ['read_video', 'video', 'text', 'audio'] : ['read_video', 'text', 'audio']);
+    assert.equal(result.text, uncertain ? 'held' : 'sent');
+    assert.equal(result.audio, uncertain ? 'held' : 'sent');
+    const expectedEffects = uncertain ? ['read_video', 'video'] : ['read_video', 'text', 'read_audio', 'audio'];
+    assert.deepEqual(effects, expectedEffects);
     const outcome = files.metrics.find(metric => metric.type === 'outcome');
     assert.equal(outcome.outcome, 'failed');
     assert.equal(outcome.reason, uncertain ? 'delivery_uncertain' : 'delivery_incomplete');
     assert.equal(outcome.delivery, result.delivery);
     assert.equal(outcome.videoDelivery, result.video);
     assert.equal(outcome.video, false);
-    releaseLateVideo();
+    const [repeated] = await files.handler([event]);
+    assert.equal(repeated.reason, 'duplicate');
+    const [restarted] = await files.create()([event]);
+    assert.equal(restarted.reason, 'duplicate');
+    assert.deepEqual(effects, expectedEffects);
+
+    if (failure === 'timeout_late_error') rejectLateVideo(new Error('Synthetic late rejection'));
+    else releaseLateVideo();
     await new Promise(resolve => setImmediate(resolve));
-    const beforeDuplicate = [...effects];
+    assert.deepEqual(effects, expectedEffects);
     const [duplicate] = await files.create()([event]);
     assert.equal(duplicate.reason, 'duplicate');
-    assert.deepEqual(effects, beforeDuplicate);
+    assert.deepEqual(effects, expectedEffects);
     assert.equal(result.delivery, uncertain ? 'uncertain' : 'partial');
   });
 }

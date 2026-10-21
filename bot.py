@@ -39,6 +39,8 @@ from telegram_audio_branding import (
 from telegram_call_rejection import TelegramCallRejectCoordinator
 from telegram_auth import telegram_user_matches_phone
 from telegram_profile_picture import poll_profile_picture_requests
+from telegram_activity import telegram_typing_activity
+from telegram_delivery_journal import TelegramVideoDeliveryJournal, TelegramVideoDeliveryUncertain
 from telegram_events import (
     PHONE_CALL_SUBTYPES,
     incoming_call_discard_request,
@@ -54,6 +56,7 @@ from telegram_dispatcher import (
     build_telegram_media_request,
     build_telegram_text_request,
     deliver_telegram_response_components,
+    telegram_queue_wait_ms,
 )
 
 
@@ -152,6 +155,9 @@ interaction_state = PersistentInteractionState(
     INTERACTION_STATE_FILE,
     default_language=DEFAULT_LANGUAGE,
 )
+video_delivery_journal = TelegramVideoDeliveryJournal(
+    INTERACTION_STATE_FILE.parent / "tg_video_delivery", PHONE,
+)
 
 
 def detect_lang(text: str) -> str | None:
@@ -238,19 +244,27 @@ interaction_health = {
 _uploaded_media_cache: dict[str, tuple[int, int, object]] = {}
 
 
-async def _upload_file_cached(file_path: Path) -> object:
+async def _upload_file_cached(file_path: Path, *, observe=None, describe=None) -> object:
     if not telegram_identity_verified:
         raise RuntimeError("Telegram account identity is not verified")
     key = str(file_path.resolve())
     stat = file_path.stat()
     signature = (stat.st_mtime_ns, stat.st_size)
     cached = _uploaded_media_cache.get(key)
-    if cached is not None and cached[0] == signature[0] and cached[1] == signature[1]:
+    cache_hit = cached is not None and cached[0] == signature[0] and cached[1] == signature[1]
+    if describe is not None:
+        describe(stat.st_size, cache_hit)
+    if cache_hit:
         return cached[2]
-    uploaded = await asyncio.wait_for(
-        client.upload_file(str(file_path)),
-        timeout=TELEGRAM_UPLOAD_TIMEOUT_SECONDS,
-    )
+    started = time.monotonic()
+    try:
+        uploaded = await asyncio.wait_for(
+            client.upload_file(str(file_path), part_size_kb=512),
+            timeout=TELEGRAM_UPLOAD_TIMEOUT_SECONDS,
+        )
+    finally:
+        if observe is not None:
+            observe("upload_ms", (time.monotonic() - started) * 1000)
     if len(_uploaded_media_cache) >= 64:
         _uploaded_media_cache.clear()
     _uploaded_media_cache[key] = (signature[0], signature[1], uploaded)
@@ -371,7 +385,7 @@ async def heartbeat() -> None:
         await asyncio.sleep(15)
 
 
-async def _retry_telegram_operation(label: str, operation, *, prepare=None):
+async def _retry_telegram_operation(label: str, operation, *, prepare=None, observe=None):
     last_error = None
     component = label.replace("_delivery", "")
     uncertain = False
@@ -395,12 +409,20 @@ async def _retry_telegram_operation(label: str, operation, *, prepare=None):
             update_delivery_health(component, "uncertain" if uncertain else "failed")
             raise RuntimeError("Telegram account identity is not verified")
         try:
-            result = await asyncio.wait_for(
-                operation(),
-                timeout=TELEGRAM_SEND_TIMEOUT_SECONDS,
-            )
+            started = time.monotonic()
+            try:
+                result = await asyncio.wait_for(
+                    operation(),
+                    timeout=TELEGRAM_SEND_TIMEOUT_SECONDS,
+                )
+            finally:
+                if observe is not None:
+                    observe("rpc_ms", (time.monotonic() - started) * 1000)
             update_delivery_health(component, "sent")
             return result
+        except TelegramVideoDeliveryUncertain:
+            update_delivery_health(component, "uncertain")
+            raise
         except asyncio.CancelledError:
             if label.endswith("_delivery"):
                 update_delivery_health(component, "uncertain")
@@ -415,6 +437,9 @@ async def _retry_telegram_operation(label: str, operation, *, prepare=None):
             ):
                 uncertain = True
             update_delivery_health(component, "uncertain" if uncertain else "failed")
+            if component == "video" and uncertain:
+                # The durable claim remains. Do not retry an ambiguous send.
+                raise TelegramVideoDeliveryUncertain("telegram_video_delivery_uncertain") from exc
             logging.warning(
                 "Telegram %s attempt %s/%s failed (%s)",
                 label,
@@ -435,8 +460,51 @@ async def send_response(
 ) -> None:
     if not telegram_identity_verified:
         raise RuntimeError("Telegram account identity is not verified")
+    started = time.monotonic()
+    telemetry = {
+        "trace_id": str(uuid.uuid4()), "observed_at": 0,
+        "response": response_key, "outcome": "failed",
+        "queue_ms": telegram_queue_wait_ms.get(), "prepare_ms": 0.0,
+        "upload_ms": 0.0, "rpc_ms": 0.0, "total_ms": 0.0,
+        "video_bytes": None, "video_cache_hit": None,
+    }
+    context = {}
+    try:
+        await _send_response_components(
+            delivery_peer, response_key, language, delivery_fingerprint, telemetry, context,
+        )
+        telemetry["outcome"] = "sent"
+    except TelegramVideoDeliveryUncertain:
+        telemetry["outcome"] = "uncertain"
+        update_delivery_health("video", "uncertain")
+        for component in ("text", "audio"):
+            if context.get(component):
+                update_delivery_health(component, "held")
+        raise
+    except asyncio.CancelledError:
+        telemetry["outcome"] = "cancelled"
+        if context.get("video") and not context.get("video_confirmed"):
+            for component in ("text", "audio"):
+                if context.get(component):
+                    update_delivery_health(component, "held")
+        raise
+    finally:
+        telemetry["observed_at"] = time.time()
+        telemetry["total_ms"] = telemetry["queue_ms"] + (time.monotonic() - started) * 1000
+        # Publish one complete local snapshot; concurrent operations never merge timings.
+        update_interaction_health(telemetry=telemetry)
+
+
+async def _send_response_components(
+    delivery_peer, response_key, language, delivery_fingerprint, telemetry, context,
+):
+    def observe(phase, duration):
+        telemetry[phase] += max(0.0, duration)
+
+    prepared_at = time.monotonic()
     load_messages_fresh()
     message_text, audio_file, video_file = get_response_components(language, response_key)
+    context.update(text=bool(message_text), audio=bool(audio_file), video=bool(video_file))
     update_interaction_health(
         last_response=response_key,
         delivery={
@@ -446,9 +514,13 @@ async def send_response(
             "video": "pending" if video_file else "skipped",
         },
     )
+    # Check even if configuration changed: removing a video cannot bypass its claim.
+    context["video_confirmed"] = video_delivery_journal.check(delivery_fingerprint)
+    observe("prepare_ms", (time.monotonic() - prepared_at) * 1000)
     resolved_peer = await _retry_telegram_operation(
         "peer_resolution",
         lambda: client.get_input_entity(delivery_peer),
+        observe=observe,
     )
 
     async def send_text_message():
@@ -461,6 +533,7 @@ async def send_response(
                     delivery_fingerprint,
                 )
             ),
+            observe=observe,
         )
 
     async def send_audio_message():
@@ -488,10 +561,10 @@ async def send_response(
         async def prepare_audio_media():
             nonlocal uploaded_file, uploaded_thumb, cover_prepared
             if uploaded_file is None:
-                uploaded_file = await _upload_file_cached(audio_path)
+                uploaded_file = await _upload_file_cached(audio_path, observe=observe)
             if not cover_prepared and AUDIO_COVER_PATH.is_file():
                 try:
-                    uploaded_thumb = await _upload_file_cached(AUDIO_COVER_PATH)
+                    uploaded_thumb = await _upload_file_cached(AUDIO_COVER_PATH, observe=observe)
                 except (OSError, errors.RPCError) as exc:
                     _evict_upload_cache(AUDIO_COVER_PATH)
                     logging.warning(
@@ -546,9 +619,14 @@ async def send_response(
             "audio_delivery",
             send_audio_media,
             prepare=prepare_audio_media,
+            observe=observe,
         )
 
     async def send_video_message():
+        if context["video_confirmed"]:
+            update_delivery_health("video", "sent")
+            return
+        prepared_at = time.monotonic()
         safe_video_name = Path(video_file).name
         video_path = VIDEO_DIR / safe_video_name
         if not safe_video_name or not video_path.is_file():
@@ -561,13 +639,16 @@ async def send_response(
             video_note=False,
             supports_streaming=True,
         )
+        observe("prepare_ms", (time.monotonic() - prepared_at) * 1000)
 
         uploaded_file = None
 
         async def prepare_video_media():
             nonlocal uploaded_file
             if uploaded_file is None:
-                uploaded_file = await _upload_file_cached(video_path)
+                def describe(size, cache_hit):
+                    telemetry.update(video_bytes=size, video_cache_hit=cache_hit)
+                uploaded_file = await _upload_file_cached(video_path, observe=observe, describe=describe)
 
         async def send_video_media():
             nonlocal uploaded_file
@@ -584,30 +665,47 @@ async def send_response(
                 delivery_fingerprint,
                 component="video",
             )
+            if not video_delivery_journal.claim(delivery_fingerprint):
+                context["video_confirmed"] = True
+                return
             try:
-                return await client(request)
+                result = await client(request)
             except (errors.TimedOutError, errors.ServerError):
                 raise
             except errors.RPCError:
+                video_delivery_journal.rejected(delivery_fingerprint)
                 _evict_upload_cache(video_path)
                 uploaded_file = None
                 raise
+            video_delivery_journal.confirmed(delivery_fingerprint)
+            context["video_confirmed"] = True
+            return result
 
         await _retry_telegram_operation(
             "video_delivery",
             send_video_media,
             prepare=prepare_video_media,
+            observe=observe,
         )
 
-    await deliver_telegram_response_components(
-        response_key,
-        send_text=send_text_message if message_text else None,
-        send_audio=send_audio_message if audio_file else None,
-        send_video=send_video_message if video_file else None,
-    )
+    async def deliver():
+        await deliver_telegram_response_components(
+            response_key,
+            send_text=send_text_message if message_text else None,
+            send_audio=send_audio_message if audio_file else None,
+            send_video=send_video_message if video_file else None,
+        )
+
+    if video_file and not context["video_confirmed"]:
+        async with telegram_typing_activity(client, resolved_peer):
+            await deliver()
+    else:
+        await deliver()
 
 
-telegram_dispatcher = TelegramInteractionDispatcher(interaction_state, send_response)
+telegram_dispatcher = TelegramInteractionDispatcher(
+    interaction_state, send_response, on_committed=video_delivery_journal.completed,
+)
 
 
 async def process_interaction(
