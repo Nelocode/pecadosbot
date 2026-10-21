@@ -29,6 +29,7 @@ from flask import (
     session,
 )
 from telegram_auth import TelegramAuthManager
+from telegram_qr import qr_image_data_url
 from language_detection import reload_language_rules
 from message_schema import (
     LANGUAGE_CODE_RE,
@@ -260,8 +261,9 @@ label { color: #c8c8e0 !important; font-weight: 500; }
             <input id="tg-phone" type="text" class="form-control form-control-sm" placeholder="+57 300 123 4567" style="font-family:monospace;font-size:0.8rem;">
           </div>
         </div>
-        <div class="d-flex align-items-center gap-2 mb-2">
+        <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
           <button id="tg-link-btn" class="btn btn-sm btn-primary" onclick="linkTelegram()">🔗 Vincular</button>
+          <button id="tg-qr-btn" class="btn btn-sm btn-outline-light" onclick="startTelegramQr()">📷 Vincular con QR</button>
         </div>
       </div>
       <div id="tg-linked-actions" style="display:none;" class="p-2 mb-2 rounded" >
@@ -294,6 +296,16 @@ label { color: #c8c8e0 !important; font-weight: 500; }
       </div>
       <div id="tg-link-status" class="small text-muted mb-3"></div>
 
+      <div id="tg-qr-section" style="display:none;color:#e8e8f0;" class="mb-3 p-3 rounded border">
+        <h6>📷 Vincular Telegram con QR</h6>
+        <p class="small mb-2">En Telegram móvil, abre <strong>Ajustes → Dispositivos → Vincular dispositivo</strong> y escanea este QR.
+          Selecciona la misma cuenta cuyo teléfono escribiste arriba y confirma la vinculación en Telegram.</p>
+        <img id="tg-qr-img" alt="QR para vincular Telegram" referrerpolicy="no-referrer"
+             style="display:none;width:260px;height:auto;aspect-ratio:1;max-width:100%;background:white;border-radius:8px;">
+        <div id="tg-qr-status" class="small mt-2" role="status" aria-live="polite"></div>
+        <button class="btn btn-sm btn-outline-light mt-2" onclick="cancelTgAuth()">✕ Cancelar QR</button>
+      </div>
+
       <!-- ── Código de verificación TG (oculto hasta que se necesite) ── -->
       <div id="tg-code-section" style="display:none;" class="mb-3 p-2" >
         <h6 class="mb-1">📨 Código de verificación</h6>
@@ -304,16 +316,16 @@ label { color: #c8c8e0 !important; font-weight: 500; }
           <button class="btn btn-sm btn-outline-light" onclick="cancelTgAuth()">✕ Cancelar</button>
         </div>
         <div id="tg-code-status" class="small text-muted mt-2"></div>
+      </div>
 
-        <!-- 2FA password (oculto hasta que se necesite) -->
-        <div id="tg-2fa-section" style="display:none;" class="mt-3">
-          <p class="small text-muted mb-2">Esta cuenta tiene verificación en dos pasos. Ingresa tu contraseña.</p>
-          <div class="d-flex gap-2">
-            <input id="tg-password-input" type="password" class="form-control form-control-sm" placeholder="Contraseña de 2FA" style="flex:1;">
-            <button class="btn btn-sm btn-success" onclick="verifyTgPassword()">✅ Verificar</button>
-          </div>
-          <div id="tg-password-status" class="small text-muted mt-1"></div>
+      <!-- 2FA compartido por acceso con código y QR -->
+      <div id="tg-2fa-section" style="display:none;" class="mt-3">
+        <p class="small text-muted mb-2">Esta cuenta tiene verificación en dos pasos. Ingresa tu contraseña.</p>
+        <div class="d-flex gap-2">
+          <input id="tg-password-input" type="password" class="form-control form-control-sm" placeholder="Contraseña de 2FA" style="flex:1;">
+          <button class="btn btn-sm btn-success" onclick="verifyTgPassword()">✅ Verificar</button>
         </div>
+        <div id="tg-password-status" class="small text-muted mt-1"></div>
       </div>
 
       <!-- ── Marca de los audios TG ── -->
@@ -1575,6 +1587,7 @@ function renderChannelState(data) {
   const tgSummary = document.getElementById("tg-account-summary");
   const tgSwitchOpen = document.getElementById("tg-switch-open-btn");
   const tgLinkButton = document.getElementById("tg-link-btn");
+  const preserveTgAuth = Boolean(tgAuthAttempt || tgAuthBusy || tgRetryTimer || tgAuthStatusActive);
   tgSwitchOpen.disabled = !data.can_manage || tg.state === "recovery_required";
   adminAccess.style.display = data.can_manage ? "none" : "block";
   if (data.can_manage) {
@@ -1587,9 +1600,9 @@ function renderChannelState(data) {
     tgCredentialsHelp.style.display = "none";
     tgInitial.style.display = "none";
     tgLinked.style.display = data.can_manage ? "block" : "none";
-    tgLinkButton.innerHTML = "🔗 Vincular";
+    if (!preserveTgAuth) tgLinkButton.innerHTML = "🔗 Vincular";
     tgSummary.textContent = "Cuenta actual: " + safeAccountLabel(tg, "Telegram vinculado");
-    document.getElementById("tg-link-status").innerHTML = data.can_manage
+    if (!preserveTgAuth || !data.can_manage) document.getElementById("tg-link-status").innerHTML = data.can_manage
       ? (tg.state === "recovery_required"
           ? "❌ <strong>Hay un respaldo pendiente de recuperación manual.</strong> No se reemplazará."
           : tg.ready
@@ -1600,8 +1613,8 @@ function renderChannelState(data) {
     tgCredentialsHelp.style.display = data.can_manage ? "block" : "none";
     tgInitial.style.display = data.can_manage ? "block" : "none";
     tgLinked.style.display = "none";
-    tgLinkButton.innerHTML = "🔗 Vincular";
-    document.getElementById("tg-link-status").innerHTML = data.can_manage
+    if (!preserveTgAuth) tgLinkButton.innerHTML = "🔗 Vincular";
+    if (!preserveTgAuth || !data.can_manage) document.getElementById("tg-link-status").innerHTML = data.can_manage
       ? "⚠️ Sin vincular. Ingresa api_id, api_hash y teléfono una sola vez."
       : "🔐 Usa la <strong>clave administrativa</strong> del operador antes de configurar Telegram.";
   }
@@ -1699,7 +1712,10 @@ async function showSetup() {
   }
   await loadChannelState();
   if (tgAuthAttempt) {
-    document.getElementById("tg-code-section").style.display = 'block';
+    if (tgAuthMethod === "qr") {
+      document.getElementById("tg-qr-section").style.display = 'block';
+      if (!tgQrTimer && tgQrPollGeneration !== tgQrGeneration && !tgAuthBusy) pollTelegramQr(tgQrGeneration);
+    } else document.getElementById("tg-code-section").style.display = 'block';
     if (tgAuthMode === "switch") {
       document.getElementById("tg-switch-section").style.display = 'block';
       document.getElementById("tg-link-status").innerHTML =
@@ -1720,6 +1736,143 @@ async function showSetup() {
 
 let tgRetryTimer = null;
 let tgAuthAttempt = sessionStorage.getItem("tg_auth_attempt") || null;
+let tgAuthMethod = sessionStorage.getItem("tg_auth_method") || "code";
+let tgAuthBusy = false;
+let tgAuthStatusActive = false;
+let tgQrTimer = null;
+let tgQrGeneration = 0;
+let tgQrPollGeneration = null;
+
+function stopTgQrPolling() {
+  tgQrGeneration += 1;
+  if (tgQrTimer) clearTimeout(tgQrTimer);
+  tgQrTimer = null;
+}
+
+function rememberTgMethod(method) {
+  tgAuthMethod = method;
+  sessionStorage.setItem("tg_auth_method", method);
+}
+
+async function showTelegramQrOutcome(data) {
+  if (data.auth_attempt) {
+    rememberTgAttempt("link", data.auth_attempt);
+    rememberTgMethod("qr");
+  }
+  const status = document.getElementById("tg-qr-status");
+  const image = document.getElementById("tg-qr-img");
+  if (data.needs_qr && data.qr_image && tgAuthAttempt) {
+    rememberTgMethod("qr");
+    document.getElementById("tg-code-section").style.display = "none";
+    document.getElementById("tg-2fa-section").style.display = "none";
+    document.getElementById("tg-qr-section").style.display = "block";
+    if (data.qr_image.startsWith("data:image/svg+xml;base64,")) {
+      if (image.getAttribute("src") !== data.qr_image) image.src = data.qr_image;
+      image.style.display = "block";
+    }
+    status.textContent = `Escanea y confirma en Telegram. Este QR vence en ${data.expires_in || 0}s y se renueva automáticamente.`;
+    document.getElementById("tg-link-status").textContent = "📷 Esperando que confirmes la vinculación en Telegram…";
+    return true;
+  }
+  if (data.needs_password) {
+    rememberTgMethod("qr");
+    image.removeAttribute("src");
+    image.style.display = "none";
+    document.getElementById("tg-qr-section").style.display = "block";
+    document.getElementById("tg-code-section").style.display = "none";
+    document.getElementById("tg-2fa-section").style.display = "block";
+    status.textContent = "QR aceptado. Completa la contraseña de verificación en dos pasos abajo.";
+    document.getElementById("tg-link-status").textContent = "🔐 Telegram requiere tu contraseña de verificación en dos pasos.";
+    document.getElementById("tg-password-input").focus();
+    return false;
+  }
+  if (data.waiting) {
+    status.textContent = "Confirmando la autorización con Telegram…";
+    return true;
+  }
+  if (data.authorized || data.already_authorized) {
+    clearTgAttempt();
+    tgAuthStatusActive = !data.ok;
+    document.getElementById("tg-api-hash").value = "";
+    document.getElementById("tg-code-section").style.display = "none";
+    document.getElementById("tg-2fa-section").style.display = "none";
+    document.getElementById("tg-link-status").textContent = data.ok
+      ? "✅ Sesión autorizada; iniciando Telegram…"
+      : "⚠️ Sesión autorizada, pero el servicio no inició. Usa Reiniciar servicio TG.";
+    toast(data.ok ? "✅ Telegram vinculado con QR" : "⚠️ Revisa el servicio de Telegram", data.ok ? "success" : "error");
+    await loadChannelState(true);
+    return false;
+  }
+  if (data.error_code === "auth_in_progress") {
+    document.getElementById("tg-link-status").textContent = "⚠️ " + data.error;
+    return false;
+  }
+  // Al terminar el intento, el QR deja de mostrarse y no queda en el DOM.
+  clearTgAttempt();
+  tgAuthStatusActive = true;
+  document.getElementById("tg-link-status").textContent = "❌ " + (data.error || "No fue posible completar el QR. Intenta nuevamente.");
+  return false;
+}
+
+async function pollTelegramQr(generation) {
+  if (generation !== tgQrGeneration || !tgAuthAttempt || tgQrPollGeneration === generation) return;
+  tgQrPollGeneration = generation;
+  tgQrTimer = null;
+  let again = true;
+  try {
+    const response = await fetch("/api/telegram_qr/status", {
+      method: "POST", headers: channelHeaders(), cache: "no-store",
+      body: JSON.stringify({auth_attempt: tgAuthAttempt})
+    });
+    const data = await response.json();
+    if (generation !== tgQrGeneration) return;
+    again = await showTelegramQrOutcome(data);
+  } catch(e) {
+    if (generation !== tgQrGeneration) return;
+    document.getElementById("tg-qr-status").textContent = "No se pudo consultar Telegram. Reintentando…";
+  } finally {
+    if (tgQrPollGeneration === generation) tgQrPollGeneration = null;
+  }
+  if (again && generation === tgQrGeneration && tgAuthAttempt) {
+    tgQrTimer = setTimeout(() => pollTelegramQr(generation), 2000);
+  }
+}
+
+async function startTelegramQr() {
+  if (tgAuthBusy) return;
+  const api_id = document.getElementById("tg-api-id").value.trim();
+  const api_hash = document.getElementById("tg-api-hash").value.trim();
+  const phone = document.getElementById("tg-phone").value.trim();
+  if (!api_id || !api_hash || !phone) {
+    toast("Completa api_id, api_hash y el teléfono de la cuenta que escaneará el QR.", "error");
+    return;
+  }
+  stopTgQrPolling();
+  const generation = tgQrGeneration;
+  tgAuthBusy = true;
+  tgAuthStatusActive = true;
+  const button = document.getElementById("tg-qr-btn");
+  button.disabled = true;
+  document.getElementById("tg-link-status").textContent = "⏳ Generando QR de Telegram…";
+  try {
+    const response = await fetch("/api/telegram_qr/start", {
+      method: "POST", headers: channelHeaders(), cache: "no-store",
+      body: JSON.stringify({api_id: Number(api_id), api_hash, phone, auth_attempt: tgAuthAttempt})
+    });
+    const data = await response.json();
+    if (generation !== tgQrGeneration) return;
+    if (await showTelegramQrOutcome(data)) {
+      tgQrTimer = setTimeout(() => pollTelegramQr(generation), 2000);
+    }
+  } catch(e) {
+    if (generation === tgQrGeneration) {
+      document.getElementById("tg-link-status").textContent = "❌ No fue posible generar el QR. Comprueba la conexión e intenta nuevamente.";
+    }
+  } finally {
+    tgAuthBusy = false;
+    button.disabled = false;
+  }
+}
 function armTgRetry(seconds) {
   const btn = document.getElementById(tgAuthMode === "switch" ? "tg-switch-btn" : "tg-link-btn");
   let remaining = Math.max(0, Number(seconds) || 0);
@@ -1754,8 +1907,15 @@ function rememberTgAttempt(mode, token) {
 }
 
 function clearTgAttempt() {
+  stopTgQrPolling();
   tgAuthAttempt = null;
   tgAuthMode = "link";
+  tgAuthStatusActive = false;
+  rememberTgMethod("code");
+  const qrImage = document.getElementById("tg-qr-img");
+  qrImage.removeAttribute("src");
+  qrImage.style.display = "none";
+  document.getElementById("tg-qr-section").style.display = "none";
   sessionStorage.removeItem("tg_auth_attempt");
   sessionStorage.removeItem("tg_auth_mode");
   if (tgRetryTimer) clearInterval(tgRetryTimer);
@@ -1839,6 +1999,7 @@ async function startTelegramSwitch() {
 }
 
 async function linkTelegram() {
+  if (tgAuthBusy) return;
   rememberTgAttempt("link", tgAuthAttempt);
   const recoveringAdmin = Boolean(
     channelState && channelState.telegram && channelState.telegram.linked && !channelState.can_manage
@@ -1850,6 +2011,12 @@ async function linkTelegram() {
   if (!api_id) { toast("❌ Ingresa el api_id", "error"); return; }
   if (!api_hash) { toast("❌ Ingresa el api_hash", "error"); return; }
   if (!phone) { toast("❌ Ingresa el número de teléfono", "error"); return; }
+
+  stopTgQrPolling();
+  rememberTgMethod("code");
+  document.getElementById("tg-qr-section").style.display = "none";
+  tgAuthBusy = true;
+  tgAuthStatusActive = true;
 
   const btn = document.getElementById("tg-link-btn");
   btn.disabled = true;
@@ -1922,13 +2089,17 @@ async function linkTelegram() {
     toast("❌ Error: " + e.message, "error");
     btn.disabled = false;
     btn.innerHTML = '🔗 Vincular';
+  } finally {
+    tgAuthBusy = false;
   }
 }
 
 async function verifyTgCode() {
+  if (tgAuthBusy) return;
   const code = document.getElementById("tg-code-input").value.trim();
   if (!code) { toast("❌ Ingresa el código", "error"); return; }
   document.getElementById("tg-code-input").value = '';
+  tgAuthBusy = true;
 
   document.getElementById("tg-code-status").innerHTML = '🔄 Verificando...';
   try {
@@ -1961,13 +2132,17 @@ async function verifyTgCode() {
     }
   } catch(e) {
     document.getElementById("tg-code-status").innerHTML = '❌ Error: ' + e.message;
+  } finally {
+    tgAuthBusy = false;
   }
 }
 
 async function verifyTgPassword() {
+  if (tgAuthBusy) return;
   const password = document.getElementById("tg-password-input").value;
   if (!password) { toast("❌ Ingresa la contraseña", "error"); return; }
   document.getElementById("tg-password-input").value = '';
+  tgAuthBusy = true;
 
   document.getElementById("tg-password-status").innerHTML = '🔄 Verificando...';
   try {
@@ -1996,16 +2171,29 @@ async function verifyTgPassword() {
     }
   } catch(e) {
     document.getElementById("tg-password-status").innerHTML = '❌ Error: ' + e.message;
+  } finally {
+    tgAuthBusy = false;
   }
 }
 
 async function cancelTgAuth() {
+  if (tgAuthBusy) return;
+  tgAuthBusy = true;
+  stopTgQrPolling();
   const switching = tgAuthMode === "switch";
-  await fetch(switching ? "/api/switch_telegram/cancel" : "/api/cancel_telegram_auth", {
-    method: "POST",
-    headers: channelHeaders(),
-    body: JSON.stringify({auth_attempt: tgAuthAttempt})
-  }).catch(() => {});
+  try {
+    const response = await fetch(switching ? "/api/switch_telegram/cancel" : "/api/cancel_telegram_auth", {
+      method: "POST",
+      headers: channelHeaders(),
+      body: JSON.stringify({auth_attempt: tgAuthAttempt})
+    });
+    const data = await response.json();
+    if (!data.ok && data.error_code !== "invalid_auth_attempt") throw new Error("cancel_failed");
+  } catch(e) {
+    tgAuthBusy = false;
+    document.getElementById("tg-link-status").textContent = "⚠️ No se pudo confirmar la cancelación. Reintenta cancelar.";
+    return;
+  }
   clearTgAttempt();
   const btn = document.getElementById(switching ? "tg-switch-btn" : "tg-link-btn");
   btn.disabled = false;
@@ -2018,6 +2206,8 @@ async function cancelTgAuth() {
   document.getElementById("tg-link-status").innerHTML = switching
     ? 'ℹ️ Cambio cancelado. La cuenta anterior sigue activa.'
     : '⚠️ Vinculación cancelada. Intenta de nuevo.';
+  tgAuthBusy = false;
+  await loadChannelState(true);
 }
 
 async function linkBotFather() {
@@ -2690,6 +2880,9 @@ def _protect_panel_api_mutations():
 
 @app.after_request
 def _protect_test_mode_responses(response):
+    if request.path.startswith("/api/telegram_qr/"):
+        response.headers["Cache-Control"] = "no-store, private"
+        response.headers["Pragma"] = "no-cache"
     if request.path in {"/api/test_mode", "/api/test_mode/reset"}:
         response.headers["Cache-Control"] = "no-store, private"
         response.headers["Pragma"] = "no-cache"
@@ -4345,6 +4538,38 @@ def api_link_telegram():
         int(api_id), api_hash, phone, data.get("auth_attempt")
     )
     return jsonify(_finish_telegram_auth(outcome))
+
+
+def _telegram_qr_response(outcome):
+    public = _finish_telegram_auth(outcome)
+    if outcome.qr_url:
+        public["qr_image"] = qr_image_data_url(outcome.qr_url)
+    return jsonify(public)
+
+
+@app.route("/api/telegram_qr/start", methods=["POST"])
+def api_start_telegram_qr():
+    """QR inicial; las cuentas ya vinculadas usan el cambio de cuenta existente."""
+    if _telegram_session_is_authorized() or _telegram_recovery_pending():
+        return jsonify({
+            "ok": False, "error_code": "already_linked",
+            "error": "Existe una cuenta o un respaldo de Telegram. Usa las opciones de la cuenta actual.",
+        }), 409
+    data = request.get_json(silent=True) or {}
+    api_id = data.get("api_id")
+    api_hash = str(data.get("api_hash") or "").strip()
+    phone = _normalize_telegram_phone(str(data.get("phone") or ""))
+    if not _valid_telegram_credentials(api_id, api_hash, phone or ""):
+        return jsonify({"ok": False, "error_code": "invalid_input",
+                        "error": "Completa api_id, api_hash y el teléfono de la cuenta que escaneará el QR."}), 400
+    outcome = _telegram_auth.begin_qr(int(api_id), api_hash, phone, data.get("auth_attempt"))
+    return _telegram_qr_response(outcome)
+
+
+@app.route("/api/telegram_qr/status", methods=["POST"])
+def api_telegram_qr_status():
+    data = request.get_json(silent=True) or {}
+    return _telegram_qr_response(_telegram_auth.qr_status(data.get("auth_attempt")))
 
 
 @app.route("/api/verify_telegram_code", methods=["POST"])
