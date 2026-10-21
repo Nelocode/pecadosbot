@@ -67,19 +67,20 @@ async def deliver_telegram_response_components(
 ) -> None:
     """Deliver one response in the channel-specific presentation order.
 
-    Calls intentionally put media first so Telegram renders the text below
-    it.  Normal conversation steps retain their historic text-then-media order.
+    Configured videos lead every response, followed by text and optional audio.
+    Without video, calls retain audio-then-text and steps text-then-audio.
     The component senders keep using their stable per-interaction ``random_id``;
     therefore replaying this orchestration after a partial/ambiguous failure is
     idempotent at Telegram's MTProto boundary.
     """
 
     first_error: Exception | None = None
-    senders = (
-        (send_audio, send_video, send_text)
-        if response_key == "call"
-        else (send_text, send_audio, send_video)
-    )
+    if send_video is not None:
+        senders = (send_video, send_text, send_audio)
+    elif response_key == "call":
+        senders = (send_audio, send_text)
+    else:
+        senders = (send_text, send_audio)
     for sender in senders:
         if sender is None:
             continue

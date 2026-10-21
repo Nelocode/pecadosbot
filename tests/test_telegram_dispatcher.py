@@ -53,34 +53,48 @@ class TelegramInteractionDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(["text", "audio"], order)
 
-    async def test_steps_and_call_deliver_video_in_expected_order(self):
-        step_order = []
+    async def test_steps_and_call_deliver_video_then_text_then_optional_audio(self):
+        for response_key in ("step1", "step2", "call"):
+            for with_audio in (True, False):
+                with self.subTest(response_key=response_key, with_audio=with_audio):
+                    order = []
+                    await deliver_telegram_response_components(
+                        response_key,
+                        send_text=lambda: self._append_async(order, "text"),
+                        send_audio=(
+                            (lambda: self._append_async(order, "audio"))
+                            if with_audio else None
+                        ),
+                        send_video=lambda: self._append_async(order, "video"),
+                    )
+                    self.assertEqual(
+                        ["video", "text", "audio"] if with_audio else ["video", "text"],
+                        order,
+                    )
 
-        async def send_text():
-            step_order.append("text")
+    async def test_video_failure_still_attempts_text_and_audio_and_preserves_first_error(self):
+        for response_key in ("step1", "step2", "call"):
+            with self.subTest(response_key=response_key):
+                order = []
+                video_error = RuntimeError("video failed")
 
-        async def send_audio():
-            step_order.append("audio")
+                async def send_video():
+                    order.append("video")
+                    raise video_error
 
-        async def send_video():
-            step_order.append("video")
+                async def send_audio():
+                    order.append("audio")
+                    raise RuntimeError("audio also failed")
 
-        await deliver_telegram_response_components(
-            "step1",
-            send_text=send_text,
-            send_audio=send_audio,
-            send_video=send_video,
-        )
-        self.assertEqual(["text", "audio", "video"], step_order)
-
-        call_order = []
-        await deliver_telegram_response_components(
-            "call",
-            send_text=lambda: self._append_async(call_order, "text"),
-            send_audio=lambda: self._append_async(call_order, "audio"),
-            send_video=lambda: self._append_async(call_order, "video"),
-        )
-        self.assertEqual(["audio", "video", "text"], call_order)
+                with self.assertRaises(RuntimeError) as caught:
+                    await deliver_telegram_response_components(
+                        response_key,
+                        send_text=lambda: self._append_async(order, "text"),
+                        send_audio=send_audio,
+                        send_video=send_video,
+                    )
+                self.assertIs(video_error, caught.exception)
+                self.assertEqual(["video", "text", "audio"], order)
 
     @staticmethod
     async def _append_async(target: list, value: str) -> None:

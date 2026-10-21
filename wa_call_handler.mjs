@@ -142,6 +142,8 @@ export function createWhatsAppCallHandler({
       reject: delivery.reject || 'not_applicable',
       text: delivery.text || 'not_applicable',
       audio: delivery.audio || 'not_applicable',
+      videoDelivery: delivery.video || 'not_applicable',
+      delivery: delivery.delivery || 'not_applicable',
       target: delivery.targetSource || 'not_applicable',
       targetKind: delivery.targetKind || 'not_applicable',
     });
@@ -315,6 +317,7 @@ export function createWhatsAppCallHandler({
       logger.info?.(`[WA CALL] Offer received${call.isVideo ? ' (video)' : ''}`);
       let language = 'en';
       let callMessage = {};
+      let preparationFailed = false;
       try {
         if (interactionDecision) {
           language = interactionDecision.language || 'es';
@@ -324,74 +327,68 @@ export function createWhatsAppCallHandler({
           callMessage = getCallMessage(language) || {};
         }
       } catch {
+        preparationFailed = true;
         logger.error?.('[WA CALL] Response preparation failed');
       }
 
       const text = typeof callMessage.text === 'string' ? callMessage.text.trim() : '';
-      // Call replies deliberately send the voice note first so WhatsApp renders
-      // the dedicated call audio above its accompanying text. Normal Step 1 / 2
-      // responses keep their existing text-first order in wa_message_handler.
-      if (callMessage.audio) {
+      const prepare = {
+        text: async () => ({ text }),
+        audio: async () => toWhatsAppAudioContent(await readAudio(callMessage.audio)),
+        video: async () => toWhatsAppVideoContent(await readVideo(callMessage.video)),
+      };
+      const configured = { text: Boolean(text), audio: Boolean(callMessage.audio), video: Boolean(callMessage.video) };
+      // Video leads configured responses. Calls without video retain audio/text.
+      const order = configured.video ? ['video', 'text', 'audio'] : ['audio', 'text'];
+      for (const component of order) {
+        if (!configured[component]) continue;
+        let content;
         try {
-          const audioContent = toWhatsAppAudioContent(await readAudio(callMessage.audio));
-          if (audioContent) {
-            await settleWithTimeout(
-              Promise.resolve(sendMessage(replyJid, audioContent)),
-              sendTimeoutMs,
-              'El envío de audio de la llamada',
-            );
-            result.audio = 'sent';
-          } else {
-            result.audio = 'missing';
-          }
+          content = await prepare[component]();
         } catch {
-          result.audio = 'failed';
-          logger.error?.('[WA CALL] Audio delivery failed');
+          result[component] = 'failed';
+          logger.error?.(`[WA CALL] ${component} preparation failed`);
+          continue;
         }
-      }
-
-      if (callMessage.video) {
-        try {
-          const videoContent = toWhatsAppVideoContent(await readVideo(callMessage.video));
-          if (videoContent) {
-            await settleWithTimeout(
-              Promise.resolve(sendMessage(replyJid, videoContent)),
-              sendTimeoutMs,
-              'El envío de video de la llamada',
-            );
-            result.video = 'sent';
-          } else {
-            result.video = 'missing';
-          }
-        } catch {
-          result.video = 'failed';
-          logger.error?.('[WA CALL] Video delivery failed');
+        if (!content) {
+          result[component] = 'missing';
+          continue;
         }
-      }
-
-      // Keep this independent from audio delivery: a missing or failed audio
-      // must not prevent the useful call instructions from reaching the user.
-      if (text) {
         try {
           await settleWithTimeout(
-            Promise.resolve(sendMessage(replyJid, { text })),
+            Promise.resolve(sendMessage(replyJid, content)),
             sendTimeoutMs,
-            'El envío de texto de la llamada',
+            `El envío de ${component} de la llamada`,
           );
-          result.text = 'sent';
+          result[component] = 'sent';
         } catch {
-          result.text = 'failed';
-          logger.error?.('[WA CALL] Text delivery failed');
+          // Sending may have succeeded without an ACK. Keep deduplication and
+          // the delivery-safety gate intact; never retry this component here.
+          result[component] = 'uncertain';
+          logger.error?.(`[WA CALL] ${component} delivery unconfirmed`);
         }
       }
-      return { reason: 'completed', result, language };
+      const outcomes = [result.text, result.audio, result.video];
+      const incomplete = preparationFailed
+        || outcomes.some(outcome => ['failed', 'missing', 'uncertain'].includes(outcome));
+      result.delivery = outcomes.includes('uncertain') ? 'uncertain'
+        : incomplete ? (outcomes.includes('sent') ? 'partial' : 'failed')
+          : outcomes.includes('sent') ? 'complete' : 'skipped';
+      const reason = incomplete
+        ? (result.delivery === 'uncertain' ? 'delivery_uncertain' : 'delivery_incomplete')
+        : 'completed';
+      if (incomplete) {
+        result.status = 'failed';
+        result.reason = reason;
+      }
+      return { reason, result, language };
     });
 
     delivery.result.reject = await rejectionPromise;
     if (delivery.reason === 'completed') {
       logger.info?.(
-        `[WA CALL] ${delivery.language.toUpperCase()} response completed ` +
-        `type=${delivery.result.response}`,
+        `[WA CALL] ${delivery.language.toUpperCase()} response processed ` +
+        `type=${delivery.result.response} delivery=${delivery.result.delivery}`,
       );
     }
     return finish(call, delivery.result, delivery.reason, {

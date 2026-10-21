@@ -192,6 +192,58 @@ class TelegramMediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("uncertain", self.health["delivery"]["video"])
         self.assertEqual("step1", self.preview().response_key)
 
+    async def test_video_lost_ack_still_delivers_text_audio_and_retry_commits_without_duplicates(self):
+        self.audio_path.write_bytes(b"synthetic audio, never sent")
+        self.worker["get_response_components"] = lambda *_: (
+            "fixture text", self.audio_path.name, self.video_path.name,
+        )
+
+        def component(request):
+            if isinstance(request, functions.messages.SendMessageRequest):
+                return "text"
+            return "video" if request.media.mime_type == "video/mp4" else "audio"
+
+        async def lose_video_ack(request):
+            result = self.provider.acknowledge(request)
+            if component(request) == "video":
+                await asyncio.Event().wait()
+            return result
+
+        self.provider.rpc_action = lose_video_ack
+        with self.assertRaisesRegex(RuntimeError, "telegram_video_delivery_failed"):
+            await self.dispatch()
+        self.assertEqual(
+            ["video", "video", "video", "text", "audio"],
+            [component(request) for request in self.provider.requests],
+        )
+        self.assertEqual(
+            {"video": "uncertain", "text": "sent", "audio": "sent"},
+            {key: self.health["delivery"][key] for key in ("video", "text", "audio")},
+        )
+        self.assertFalse(self.preview().duplicate)
+        self.assertEqual("step1", self.preview().response_key)
+        self.assertEqual(3, len(self.provider.remote_messages))
+        first_ids = {component(request): request.random_id for request in self.provider.requests}
+        self.assertEqual(3, len(set(first_ids.values())))
+
+        self.provider.rpc_action = None
+        decision = await self.dispatch()
+        self.assertEqual(1, decision.phase)
+        self.assertTrue(self.preview().duplicate)
+        self.assertEqual(
+            ["video", "text", "audio"],
+            [component(request) for request in self.provider.requests[-3:]],
+        )
+        self.assertEqual(
+            first_ids,
+            {component(request): request.random_id for request in self.provider.requests[-3:]},
+        )
+        self.assertEqual(3, len(self.provider.remote_messages))
+        self.assertEqual(["fixture.mp4", "fixture.mp3"], self.provider.uploads)
+        request_count = len(self.provider.requests)
+        self.assertTrue((await self.dispatch()).duplicate)
+        self.assertEqual(request_count, len(self.provider.requests))
+
     async def test_uncertainty_survives_later_rejection_or_prepare_failure(self):
         async def ambiguous_then_rejected(request):
             if len(self.provider.requests) == 1:
@@ -326,4 +378,4 @@ class TelegramMediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.preview().duplicate)
         self.assertEqual(3, len(self.provider.remote_messages))
         self.assertEqual(first_ids[0], self.provider.requests[2].random_id)
-        self.assertEqual(first_ids[1], self.provider.requests[4].random_id)
+        self.assertEqual(first_ids[1], self.provider.requests[3].random_id)

@@ -194,7 +194,9 @@ test('un fallo enviando texto ocurre despues de haber enviado el audio', async (
 
   const result = await handler([offer()]);
 
-  assert.equal(result[0].text, 'failed');
+  assert.equal(result[0].text, 'uncertain');
+  assert.equal(result[0].status, 'failed');
+  assert.equal(result[0].delivery, 'uncertain');
   assert.equal(result[0].audio, 'sent');
   assert.equal(effects.length, 2);
   assert.ok(effects[0][2].audio);
@@ -534,7 +536,7 @@ test('operational pause rejects the call without consuming interaction state', a
   assert.deepEqual(effects, ['reject', 'reject', 'send']);
 });
 
-test('entrega audio, video y texto en respuesta a llamada cuando hay video configurado', async () => {
+test('entrega video, texto y audio en respuesta a llamada cuando hay video configurado', async () => {
   const effects = [];
   const handler = createWhatsAppCallHandler({
     rejectCall: async (id, from) => effects.push(['reject', id, from]),
@@ -552,12 +554,158 @@ test('entrega audio, video y texto en respuesta a llamada cuando hay video confi
   assert.equal(result[0].audio, 'sent');
   assert.equal(result[0].video, 'sent');
   assert.equal(result[0].text, 'sent');
+  assert.equal(result[0].delivery, 'complete');
   const sentContents = effects.filter(([kind]) => kind === 'send').map(([, , content]) => content);
   assert.equal(sentContents.length, 3);
-  assert.ok(sentContents[0].audio);
-  assert.deepEqual(sentContents[1], {
+  assert.deepEqual(sentContents[0], {
     video: Buffer.from('call-video'),
     mimetype: 'video/mp4',
   });
-  assert.deepEqual(sentContents[2], { text: 'Te llamamos pronto' });
+  assert.deepEqual(sentContents[1], { text: 'Te llamamos pronto' });
+  assert.ok(sentContents[2].audio);
 });
+
+function videoFirstCallHarness(t, overrides = {}) {
+  const temporaryRoot = fs.realpathSync(os.tmpdir());
+  const directory = fs.mkdtempSync(path.join(temporaryRoot, 'wa-call-video-first-'));
+  t.after(() => {
+    const target = fs.realpathSync(directory);
+    assert.equal(path.dirname(target), temporaryRoot);
+    fs.rmSync(target, { recursive: true, force: true });
+  });
+  const statePath = path.join(directory, 'state.json');
+  const effects = [];
+  const metrics = [];
+  const create = () => {
+    const state = new PersistentInteractionState({ filePath: statePath });
+    return createWhatsAppCallHandler({
+      rejectCall: async () => {},
+      sendMessage: async (_jid, content) => effects.push(content),
+      routeInteraction: details => state.register(details),
+      getResponseMessage: () => ({ text: 'call', audio: 'audio.mp3', video: 'video.mp4' }),
+      readAudio: async () => Buffer.from('audio'),
+      readVideo: async () => ({ buffer: Buffer.from('video'), mimetype: 'video/mp4' }),
+      onCallMetric: metric => metrics.push(metric),
+      sendTimeoutMs: 100,
+      logger: { info() {}, warn() {}, error() {} },
+      ...overrides,
+    });
+  };
+  return { handler: create(), create, effects, metrics };
+}
+
+test('call waits for video acknowledgement before text and audio', async t => {
+  const effects = [];
+  let releaseVideo;
+  let signalStarted;
+  const started = new Promise(resolve => { signalStarted = resolve; });
+  const gate = new Promise(resolve => { releaseVideo = resolve; });
+  const files = videoFirstCallHarness(t, {
+    sendMessage: async (_jid, content) => {
+      effects.push(content.video ? 'video' : content.text ? 'text' : 'audio');
+      if (content.video) {
+        signalStarted();
+        await gate;
+      }
+    },
+  });
+  const pending = files.handler([offer({ id: 'video-call-order' })]);
+  await started;
+  assert.deepEqual(effects, ['video']);
+  releaseVideo();
+  const [result] = await pending;
+  assert.equal(result.response, 'call');
+  assert.equal(result.delivery, 'complete');
+  assert.deepEqual(effects, ['video', 'text', 'audio']);
+});
+
+test('call video with empty audio skips its reader and keeps video then text', async t => {
+  const files = videoFirstCallHarness(t, {
+    getResponseMessage: () => ({ text: 'call', audio: '', video: 'video.mp4' }),
+    readAudio: async () => { throw new Error('empty audio must not be read'); },
+  });
+  const [result] = await files.handler([offer({ id: 'video-no-audio' })]);
+  assert.equal(result.audio, 'skipped');
+  assert.equal(result.delivery, 'complete');
+  assert.deepEqual(files.effects.map(content => content.video ? 'video' : 'text'), ['video', 'text']);
+});
+
+test('call without video retains audio then text and never reads video', async t => {
+  const files = videoFirstCallHarness(t, {
+    getResponseMessage: () => ({ text: 'call', audio: 'audio.mp3', video: '' }),
+    readVideo: async () => { throw new Error('unconfigured video must not be read'); },
+  });
+  const [result] = await files.handler([offer({ id: 'without-video' })]);
+  assert.equal(result.video, 'skipped');
+  assert.equal(result.delivery, 'complete');
+  assert.deepEqual(files.effects.map(content => content.audio ? 'audio' : 'text'), ['audio', 'text']);
+});
+
+test('call with only a missing video cannot report a completed delivery', async t => {
+  const files = videoFirstCallHarness(t, {
+    getResponseMessage: () => ({ text: '', audio: '', video: 'video.mp4' }),
+    readVideo: async () => null,
+  });
+  const [result] = await files.handler([offer({ id: 'video-only-missing' })]);
+  assert.equal(result.status, 'failed');
+  assert.equal(result.delivery, 'failed');
+  assert.equal(result.reason, 'delivery_incomplete');
+  assert.deepEqual([result.text, result.audio, result.video], ['skipped', 'skipped', 'missing']);
+  assert.deepEqual(files.effects, []);
+});
+
+test('call response preparation failure is reported without claiming delivery success', async t => {
+  const files = videoFirstCallHarness(t, {
+    getResponseMessage: () => { throw new Error('synthetic configuration failure'); },
+  });
+  const [result] = await files.handler([offer({ id: 'preparation-error' })]);
+  assert.equal(result.status, 'failed');
+  assert.equal(result.delivery, 'failed');
+  assert.equal(result.reason, 'delivery_incomplete');
+  assert.deepEqual(files.effects, []);
+});
+
+for (const failure of ['missing', 'read_error', 'send_error', 'timeout']) {
+  test(`call video ${failure} preserves fallback order, truthful metrics and persistent deduplication`, async t => {
+    const effects = [];
+    let releaseLateVideo;
+    const lateVideo = new Promise(resolve => { releaseLateVideo = resolve; });
+    const files = videoFirstCallHarness(t, {
+      sendTimeoutMs: 10,
+      readVideo: async () => {
+        effects.push('read_video');
+        if (failure === 'missing') return null;
+        if (failure === 'read_error') throw new Error('synthetic read failure');
+        return Buffer.from('video');
+      },
+      sendMessage: async (_jid, content) => {
+        const component = content.video ? 'video' : content.text ? 'text' : 'audio';
+        effects.push(component);
+        if (component === 'video' && failure === 'send_error') throw new Error('lost acknowledgement');
+        if (component === 'video' && failure === 'timeout') await lateVideo;
+      },
+    });
+    const event = offer({ id: `video-${failure}` });
+    const [result] = await files.handler([event]);
+    const uncertain = ['send_error', 'timeout'].includes(failure);
+    assert.equal(result.video, uncertain ? 'uncertain' : failure === 'missing' ? 'missing' : 'failed');
+    assert.equal(result.status, 'failed');
+    assert.equal(result.delivery, uncertain ? 'uncertain' : 'partial');
+    assert.equal(result.text, 'sent');
+    assert.equal(result.audio, 'sent');
+    assert.deepEqual(effects, uncertain ? ['read_video', 'video', 'text', 'audio'] : ['read_video', 'text', 'audio']);
+    const outcome = files.metrics.find(metric => metric.type === 'outcome');
+    assert.equal(outcome.outcome, 'failed');
+    assert.equal(outcome.reason, uncertain ? 'delivery_uncertain' : 'delivery_incomplete');
+    assert.equal(outcome.delivery, result.delivery);
+    assert.equal(outcome.videoDelivery, result.video);
+    assert.equal(outcome.video, false);
+    releaseLateVideo();
+    await new Promise(resolve => setImmediate(resolve));
+    const beforeDuplicate = [...effects];
+    const [duplicate] = await files.create()([event]);
+    assert.equal(duplicate.reason, 'duplicate');
+    assert.deepEqual(effects, beforeDuplicate);
+    assert.equal(result.delivery, uncertain ? 'uncertain' : 'partial');
+  });
+}

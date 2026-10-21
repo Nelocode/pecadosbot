@@ -3716,6 +3716,8 @@ _WA_CALL_HEALTH_DEFAULT = {
         "reject": "never",
         "text": "never",
         "audio": "never",
+        "video_delivery": "never",
+        "delivery": "never",
         "target": "never",
         "target_kind": "never",
     },
@@ -3791,7 +3793,7 @@ def _read_wa_call_health(file_path: Path = WA_CALL_HEALTH_FILE):
 
     pipeline = raw.get("pipeline") if isinstance(raw.get("pipeline"), dict) else {}
     delivery = {
-        "sent", "failed", "missing", "skipped", "skipped_offline",
+        "sent", "failed", "uncertain", "missing", "skipped", "skipped_offline",
         "not_applicable", "never"
     }
     result["pipeline"] = {
@@ -3805,7 +3807,7 @@ def _read_wa_call_health(file_path: Path = WA_CALL_HEALTH_FILE):
         ),
         "reason": _safe_enum(
             pipeline.get("reason"),
-            {"completed", "non_offer", "invalid_event", "missing_identity", "group_call", "duplicate", "unexpected_error", "never"},
+            {"completed", "delivery_incomplete", "delivery_uncertain", "non_offer", "invalid_event", "missing_identity", "group_call", "duplicate", "unexpected_error", "never"},
             "unexpected_error",
         ),
         "offline": pipeline.get("offline") if isinstance(pipeline.get("offline"), bool) else None,
@@ -3814,6 +3816,12 @@ def _read_wa_call_health(file_path: Path = WA_CALL_HEALTH_FILE):
         "reject": _safe_enum(pipeline.get("reject"), delivery, "not_applicable"),
         "text": _safe_enum(pipeline.get("text"), delivery, "not_applicable"),
         "audio": _safe_enum(pipeline.get("audio"), delivery, "not_applicable"),
+        "video_delivery": _safe_enum(pipeline.get("video_delivery"), delivery, "not_applicable"),
+        "delivery": _safe_enum(
+            pipeline.get("delivery"),
+            {"complete", "partial", "failed", "uncertain", "skipped", "not_applicable", "never"},
+            "not_applicable",
+        ),
         "target": _safe_enum(
             pipeline.get("target"),
             {"caller_pn", "chat_id", "from", "missing", "not_applicable", "never"},

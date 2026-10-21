@@ -54,6 +54,8 @@ test('persiste solo un snapshot anonimizado y acotado', () => {
   assert.equal(parsed.pipeline.outcome, 'handled');
   assert.equal(parsed.pipeline.target, 'caller_pn');
   assert.equal(parsed.pipeline.target_kind, 'pn');
+  assert.equal(parsed.pipeline.video_delivery, 'not_applicable');
+  assert.equal(parsed.pipeline.delivery, 'not_applicable');
   assert.doesNotMatch(
     persisted,
     /573001234567|@s\.whatsapp\.net|call-1|No podemos|call\.mp3|phone|jid|callId|message|audioPath/,
@@ -61,6 +63,44 @@ test('persiste solo un snapshot anonimizado y acotado', () => {
   assert.ok(persisted.length < 2_000);
 
   fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test('conserva fallos parciales e incertidumbre sin confundir la videollamada entrante', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-call-health-'));
+  try {
+    const filePath = path.join(directory, 'health.json');
+    const health = createWhatsAppCallHealth({ filePath, idFactory: idFactory(), logger: { warn() {} } });
+    for (const [videoDelivery, delivery, reason] of [
+      ['missing', 'partial', 'delivery_incomplete'],
+      ['failed', 'failed', 'delivery_incomplete'],
+      ['uncertain', 'uncertain', 'delivery_uncertain'],
+      ['sent', 'complete', 'completed'],
+    ]) {
+      health.record({
+        type: 'outcome', event: 'offer', outcome: delivery === 'complete' ? 'handled' : 'failed',
+        reason, video: false, videoDelivery, delivery, text: 'sent', audio: 'skipped',
+        privatePath: 'private-fixture.mp4',
+      });
+      const saved = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      assert.equal(saved.pipeline.video, false);
+      assert.equal(saved.pipeline.video_delivery, videoDelivery);
+      assert.equal(saved.pipeline.delivery, delivery);
+      assert.equal(saved.pipeline.reason, reason);
+      assert.doesNotMatch(JSON.stringify(saved), /private-fixture|privatePath/);
+    }
+    health.record({
+      type: 'outcome', event: 'offer', video: 'sent', videoDelivery: 'private-video',
+      delivery: 'private-delivery', text: 'private-text', reason: 'private-reason',
+    });
+    const safe = health.snapshot().pipeline;
+    assert.equal(safe.video, null);
+    assert.equal(safe.video_delivery, 'not_applicable');
+    assert.equal(safe.delivery, 'not_applicable');
+    assert.equal(safe.reason, 'unexpected_error');
+    assert.doesNotMatch(JSON.stringify(safe), /private-/);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('normaliza valores desconocidos a enums seguros', () => {
