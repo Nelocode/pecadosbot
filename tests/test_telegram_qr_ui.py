@@ -24,6 +24,7 @@ const elements = new Map();
 const storage = new Map();
 let nextTimer = 0;
 const timers = new Map();
+const notifications = [];
 const element = id => {
   if (!elements.has(id)) elements.set(id, {
     style: {}, value: '', innerHTML: '', textContent: '', disabled: false,
@@ -40,7 +41,7 @@ const context = vm.createContext({
   setInterval: fn => { timers.set(++nextTimer, fn); return nextTimer; },
   clearInterval: id => timers.delete(id),
   loadChannelState: async () => {}, channelHeaders: () => ({}),
-  toast() {}, setAdminAccessStatus() {}, loadTestMode() {}, renderTestModeState() {},
+  toast(message, type) { notifications.push({message, type}); }, setAdminAccessStatus() {}, loadTestMode() {}, renderTestModeState() {},
   safeAccountLabel: () => 'Cuenta', revealWaQrCard() {}, beginWaSwitchPolling() {},
   waSwitchPolling: false, fetch: async () => { throw new Error('unexpected network'); }
 });
@@ -106,6 +107,51 @@ assert.equal(run('tgAuthAttempt'), null);
 assert.equal(element('tg-qr-img').getAttribute('src'), null);
 assert.equal(element('tg-qr-section').style.display, 'none');
 assert.equal(timers.size, 0);
+""")
+
+    def test_photo_status_renders_separately_from_pending_authentication(self):
+        self.run_ui(r"""
+run("rememberTgAttempt('link', 'owned-attempt'); rememberTgMethod('qr');");
+element('tg-link-status').innerHTML = 'Confirma el QR en Telegram';
+element('tg-link-btn').innerHTML = 'Esperando confirmación';
+run(`renderChannelState({can_manage:true,
+  telegram:{linked:false, profile_photo:{status:'pending', message:'Foto pendiente'}},
+  whatsapp:{linked:true, ready:true, profile_photo:{status:'applied', message:'WhatsApp confirmó'}}})`);
+assert.equal(element('tg-profile-photo-status').textContent, 'Foto pendiente');
+assert.equal(element('wa-profile-photo-status').textContent, 'WhatsApp confirmó');
+assert.match(element('wa-profile-photo-status').className, /text-success/);
+assert.equal(element('tg-link-status').innerHTML, 'Confirma el QR en Telegram');
+assert.equal(element('tg-link-btn').innerHTML, 'Esperando confirmación');
+run('renderChannelState({can_manage:false, telegram:{}, whatsapp:{}})');
+assert.equal(element('tg-profile-photo-status').textContent, '');
+assert.equal(element('wa-profile-photo-status').textContent, '');
+""")
+
+    def test_server_photo_status_replaces_transient_failure_without_overwriting_auth(self):
+        self.run_ui(r"""
+run("rememberTgAttempt('link', 'owned-attempt'); rememberTgMethod('qr');");
+element('tg-link-status').innerHTML = 'Confirma el QR en Telegram';
+element('tg-link-btn').innerHTML = 'Esperando';
+run(`showTelegramPhotoOutcome({ok:true, authorized:true,
+  profile_photo:{status:'failed', message:'Cuenta vinculada; no se pudo preparar la foto'}})`);
+assert.equal(element('tg-profile-photo-status').textContent, 'Cuenta vinculada; no se pudo preparar la foto');
+assert.match(element('tg-profile-photo-status').className, /text-warning/);
+assert.equal(notifications.length, 1);
+assert.equal(notifications[0].type, 'error');
+assert.equal(element('tg-link-status').innerHTML, 'Confirma el QR en Telegram');
+run(`renderChannelState({can_manage:true,
+  telegram:{linked:true, ready:true, profile_photo:{status:'applied', message:'Foto aplicada'}}, whatsapp:{}})`);
+assert.equal(element('tg-profile-photo-status').textContent, 'Foto aplicada');
+assert.match(element('tg-profile-photo-status').className, /text-success/);
+assert.equal(element('tg-link-status').innerHTML, 'Confirma el QR en Telegram');
+assert.equal(element('tg-link-btn').innerHTML, 'Esperando');
+run(`showTelegramPhotoOutcome({profile_photo:{status:'unverified', message:'No se pudo verificar'}})`);
+assert.equal(notifications.length, 2);
+assert.equal(notifications[1].type, 'error');
+run(`renderChannelState({can_manage:true,
+  telegram:{linked:true, profile_photo:{status:'pending', message:'Nueva cuenta pendiente'}}, whatsapp:{}})`);
+assert.equal(element('tg-profile-photo-status').textContent, 'Nueva cuenta pendiente');
+assert.doesNotMatch(element('tg-profile-photo-status').className, /text-warning/);
 """)
 
 

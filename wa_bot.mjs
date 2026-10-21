@@ -6,6 +6,7 @@
 import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { Boom } from '@hapi/boom';
 import QRCode from 'qrcode';
@@ -16,7 +17,7 @@ import { createWhatsAppMessageHandler } from './wa_message_handler.mjs';
 import { KeyedSerialQueue } from './keyed_serial_queue.mjs';
 import { classifyWhatsAppDisconnect } from './wa_disconnect_policy.mjs';
 import { createWhatsAppVoiceNoteReader, createWhatsAppVideoReader } from './wa_audio_delivery.mjs';
-import { applyWhatsAppProfilePicture } from './wa_profile_picture.mjs';
+import { applyWhatsAppProfilePicture, whatsappProfileAccountHash } from './wa_profile_picture.mjs';
 import { createWhatsAppSafetyHealth } from './wa_safety_health.mjs';
 import {
   createWhatsAppDeliverySafety,
@@ -48,9 +49,8 @@ const INTERACTION_STATE_FILE = path.resolve(
 const VOICE_NOTE_CACHE_DIR = path.resolve(
   process.env.WA_VOICE_NOTE_CACHE_DIR || path.join(DATA_DIR, 'wa_voice_notes'),
 );
-const PROFILE_PICTURE_PATH = path.resolve(
-  process.env.WA_PROFILE_PICTURE_PATH || path.join(BASE_DIR, 'assets', 'pecadosvip-profile-logo.png'),
-);
+const OFFICIAL_PROFILE_PICTURE_PATH = path.join(BASE_DIR, 'assets', 'pecadosvip-profile-logo.png');
+const PROFILE_PICTURE_PATH = path.resolve(process.env.WA_PROFILE_PICTURE_PATH || OFFICIAL_PROFILE_PICTURE_PATH);
 const PROFILE_PICTURE_STATE_FILE = path.resolve(
   process.env.WA_PROFILE_PICTURE_STATE_FILE || path.join(DATA_DIR, 'wa_profile_picture_state.json'),
 );
@@ -121,6 +121,7 @@ function writeIdentity(user) {
     : 'Cuenta de WhatsApp';
   const payload = {
     display_name: displayName,
+    account_hash: whatsappProfileAccountHash(user?.id),
     phone_hint: digits.length >= 4 ? `••••${digits.slice(-4)}` : null,
     updated_at: Date.now(),
   };
@@ -430,12 +431,18 @@ async function startBot() {
         console.warn('[WA] No fue posible actualizar la identidad mostrable');
       }
       if (!LINK_ONLY && PROFILE_PICTURE_ENABLED) {
+        let expectedImageHash = null;
+        try {
+          expectedImageHash = crypto.createHash('sha256')
+            .update(fs.readFileSync(OFFICIAL_PROFILE_PICTURE_PATH)).digest('hex');
+        } catch { /* The profile helper records official_image_missing and does not send. */ }
         void applyWhatsAppProfilePicture({
           jid: sock.user?.id,
           updateProfilePicture: (jid, image, dimensions) => (
             sock.updateProfilePicture(jid, image, dimensions)
           ),
           imagePath: PROFILE_PICTURE_PATH,
+          expectedImageHash,
           statePath: PROFILE_PICTURE_STATE_FILE,
           logger: console,
         }).catch(() => {

@@ -30,6 +30,8 @@ from flask import (
 )
 from telegram_auth import TelegramAuthManager
 from telegram_qr import qr_image_data_url
+from telegram_profile_picture import request_profile_picture, public_profile_picture_status
+from profile_photo_status import official_image_matches, whatsapp_profile_picture_status
 from language_detection import reload_language_rules
 from message_schema import (
     LANGUAGE_CODE_RE,
@@ -52,6 +54,7 @@ from test_mode import (
 from wa_safety import public_wa_safety_health, set_wa_operator_paused
 
 BASE_DIR = Path(__file__).parent
+PROFILE_LOGO_PATH = BASE_DIR / "assets" / "pecadosvip-profile-logo.png"
 DATA_DIR = BASE_DIR / "data"
 AUDIO_DIR = DATA_DIR / "audios"
 VIDEO_DIR = DATA_DIR / "videos"
@@ -295,6 +298,12 @@ label { color: #c8c8e0 !important; font-weight: 500; }
         </div>
       </div>
       <div id="tg-link-status" class="small text-muted mb-3"></div>
+      <div class="d-flex gap-2 align-items-center mb-3">
+        <img src="/api/profile_photo/logo" alt="Logotipo oficial de PecadosVIP" width="56" height="56">
+        <div class="small">Al vincular una nueva cuenta de Telegram, se aplicará este logotipo a su perfil.
+          <div id="tg-profile-photo-status" class="text-muted" role="status" aria-live="polite"></div>
+        </div>
+      </div>
 
       <div id="tg-qr-section" style="display:none;color:#e8e8f0;" class="mb-3 p-3 rounded border">
         <h6>📷 Vincular Telegram con QR</h6>
@@ -394,6 +403,12 @@ label { color: #c8c8e0 !important; font-weight: 500; }
         <button id="wa-switch-btn" class="btn btn-sm btn-primary" onclick="startWaSwitch()">📲 Vincular WhatsApp</button>
       </div>
       <div id="wa-link-status" class="small text-muted mt-2"></div>
+      <div class="d-flex gap-2 align-items-center mt-3">
+        <img src="/api/profile_photo/logo" alt="Logotipo oficial de PecadosVIP" width="56" height="56">
+        <div class="small">Al vincular WhatsApp, se aplicará este logotipo a su perfil.
+          <div id="wa-profile-photo-status" class="text-muted" role="status" aria-live="polite"></div>
+        </div>
+      </div>
 
       <!-- ── Servidor (futuro deploy) ── -->
       <hr class="my-3">
@@ -1579,6 +1594,14 @@ function renderChannelState(data) {
   channelState = data;
   channelCsrf = data.csrf || channelCsrf;
 
+  for (const [channel, prefix] of [[data.telegram, "tg"], [data.whatsapp, "wa"]]) {
+    const photo = channel && channel.profile_photo;
+    const status = document.getElementById(prefix + "-profile-photo-status");
+    status.textContent = data.can_manage && photo ? photo.message : "";
+    status.className = "mt-1 " + (photo && photo.status === "applied" ? "text-success" :
+      photo && ["failed", "missing", "uncertain", "unverified"].includes(photo.status) ? "text-warning" : "text-muted");
+  }
+
   const tg = data.telegram || {};
   const tgInitial = document.getElementById("tg-initial-link");
   const tgLinked = document.getElementById("tg-linked-actions");
@@ -1735,6 +1758,15 @@ async function showSetup() {
 }
 
 let tgRetryTimer = null;
+function showTelegramPhotoOutcome(data) {
+  if (data.profile_photo) {
+    const status = document.getElementById("tg-profile-photo-status");
+    status.textContent = data.profile_photo.message;
+    const failed = ["failed", "unverified"].includes(data.profile_photo.status);
+    status.className = "mt-1 " + (failed ? "text-warning" : "text-muted");
+    if (failed) toast(data.profile_photo.message, "error");
+  }
+}
 let tgAuthAttempt = sessionStorage.getItem("tg_auth_attempt") || null;
 let tgAuthMethod = sessionStorage.getItem("tg_auth_method") || "code";
 let tgAuthBusy = false;
@@ -1801,6 +1833,7 @@ async function showTelegramQrOutcome(data) {
       : "⚠️ Sesión autorizada, pero el servicio no inició. Usa Reiniciar servicio TG.";
     toast(data.ok ? "✅ Telegram vinculado con QR" : "⚠️ Revisa el servicio de Telegram", data.ok ? "success" : "error");
     await loadChannelState(true);
+    showTelegramPhotoOutcome(data);
     return false;
   }
   if (data.error_code === "auth_in_progress") {
@@ -2071,9 +2104,8 @@ async function linkTelegram() {
       await loadChannelState(true);
       if (recoveredAdmin) {
         requestAnimationFrame(() => document.getElementById("wa-switch-btn").scrollIntoView({behavior: "smooth", block: "center"}));
-      } else {
-        setTimeout(() => document.getElementById("setup-modal").style.display = 'none', 1500);
       }
+      showTelegramPhotoOutcome(d);
       btn.disabled = false;
       btn.innerHTML = '🔗 Vincular';
     } else {
@@ -2121,7 +2153,7 @@ async function verifyTgCode() {
       document.getElementById("tg-code-section").style.display = 'none';
       document.getElementById("tg-switch-section").style.display = 'none';
       await loadChannelState();
-      if (!wasSwitch) setTimeout(() => document.getElementById("setup-modal").style.display = 'none', 1500);
+      showTelegramPhotoOutcome(d);
     } else if (d.needs_password) {
       // 2FA requerido
       document.getElementById("tg-2fa-section").style.display = 'block';
@@ -2165,7 +2197,7 @@ async function verifyTgPassword() {
       document.getElementById("tg-2fa-section").style.display = 'none';
       document.getElementById("tg-switch-section").style.display = 'none';
       await loadChannelState();
-      if (!wasSwitch) setTimeout(() => document.getElementById("setup-modal").style.display = 'none', 1500);
+      showTelegramPhotoOutcome(d);
     } else {
       document.getElementById("tg-password-status").innerHTML = '❌ ' + (d.error || "Contraseña incorrecta");
     }
@@ -4433,6 +4465,29 @@ def api_admin_access_operator():
     })
 
 
+def _telegram_profile_image():
+    return Path(os.environ.get("TG_PROFILE_PICTURE_PATH") or PROFILE_LOGO_PATH)
+
+
+def _telegram_profile_status(phone):
+    if os.environ.get("TG_PROFILE_PICTURE_ENABLED", "1") == "0":
+        return {"status": "disabled", "message": "La foto automática está desactivada."}
+    image_path = _telegram_profile_image()
+    if not official_image_matches(image_path, PROFILE_LOGO_PATH):
+        return {"status": "failed", "message": "La imagen configurada no coincide con el logotipo oficial de PecadosVIP o no está disponible."}
+    return public_profile_picture_status(DATA_DIR, phone or "", image_path)
+
+
+def _queue_telegram_profile_picture(phone):
+    if (os.environ.get("TG_PROFILE_PICTURE_ENABLED", "1") == "0" or
+            not official_image_matches(_telegram_profile_image(), PROFILE_LOGO_PATH)):
+        return _telegram_profile_status(phone)
+    try:
+        return request_profile_picture(DATA_DIR, phone, _telegram_profile_image())
+    except (OSError, ValueError):
+        return {"status": "failed", "message": "La cuenta está vinculada, pero no se pudo preparar la actualización del logotipo."}
+
+
 def _finish_telegram_auth(outcome):
     """Persiste sólo credenciales verificadas e inicia el worker."""
     public = dict(outcome.public)
@@ -4459,6 +4514,8 @@ def _finish_telegram_auth(outcome):
     })
     if not started:
         public["error"] = message
+    elif not public.get("already_authorized"):
+        public["profile_photo"] = _queue_telegram_profile_picture(phone)
     return public
 
 
@@ -4484,6 +4541,7 @@ def _finish_telegram_switch(outcome):
     if switched:
         session["channel_admin"] = True
         session.permanent = True
+        public["profile_photo"] = _queue_telegram_profile_picture(phone)
     else:
         public.update({
             "error_code": "activation_failed",
@@ -5684,6 +5742,12 @@ def api_switch_wa_cancel():
     return jsonify({"ok": True, "message": "Cambio cancelado; la cuenta anterior sigue activa."})
 
 
+@app.route("/api/profile_photo/logo")
+def api_profile_photo_logo():
+    # Public brand asset; this route never reads account or session files.
+    return send_from_directory(PROFILE_LOGO_PATH.parent, PROFILE_LOGO_PATH.name)
+
+
 @app.route("/api/channels")
 def api_channels():
     """Resumen seguro para la UX de vinculación y cambio de cuentas."""
@@ -5727,6 +5791,7 @@ def api_channels():
             "display_name": tg_identity.get("display_name") if tg_authorized and can_manage else None,
             "username": tg_identity.get("username") if tg_authorized and can_manage else None,
             "phone_hint": _mask_phone(tg_phone) if tg_authorized and can_manage else None,
+            "profile_photo": _telegram_profile_status(tg_phone) if can_manage and tg_authorized else None,
         },
         "whatsapp": {
             "linked": wa_auth_present,
@@ -5746,6 +5811,13 @@ def api_channels():
             "reauth_required": wa_reauth_required,
             "switch_in_progress": wa_switch_active if can_manage else False,
             "switch_owned_by_this_browser": wa_switch_owned if can_manage else False,
+            "profile_photo": whatsapp_profile_picture_status(
+                WA_IDENTITY_FILE,
+                Path(os.environ.get("WA_PROFILE_PICTURE_STATE_FILE") or DATA_DIR / "wa_profile_picture_state.json"),
+                Path(os.environ.get("WA_PROFILE_PICTURE_PATH") or PROFILE_LOGO_PATH),
+                PROFILE_LOGO_PATH,
+                enabled=os.environ.get("WA_PROFILE_PICTURE_ENABLED", "1") != "0",
+            ) if can_manage and wa_auth_present else None,
         },
     })
     response.headers["Cache-Control"] = "no-store, private"
