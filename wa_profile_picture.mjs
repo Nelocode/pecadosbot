@@ -187,7 +187,10 @@ export async function applyWhatsAppProfilePicture({
     if (previous?.requestId === request.requestId && previous.status === 'failed') {
       return { status: 'failed', errorCode: previous.errorCode || 'rejected' };
     }
-    if (previous?.status === 'applied' && previous.imageHash === imageHash) {
+    // Reconnects may replay the same request. A new explicit link request must
+    // apply again: an older ACK does not describe the account's current photo.
+    if (previous?.status === 'applied' && previous.imageHash === imageHash
+      && previous.requestId === request.requestId) {
       if (!previous.verification) {
         writeAccount(statePath, accountHash, {
           ...previous, verification: 'provider_acknowledged',

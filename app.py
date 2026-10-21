@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import timedelta
+from functools import wraps
 from pathlib import Path
 from flask import (
     Flask,
@@ -139,6 +140,7 @@ _wa_process_lock = threading.RLock()
 _wa_switch_lock = threading.RLock()
 _test_mode_lock = threading.RLock()
 _wa_safety_lock = threading.RLock()
+_messages_lock = threading.RLock()
 _wa_switch_expiry_timer: threading.Timer | None = None
 
 # ── HTML Template (todo en uno para portabilidad) ───────────────────
@@ -1718,9 +1720,17 @@ async function loadChannelState(force=false) {
     try {
       const r = await fetch("/api/channels", {cache: "no-store"});
       const data = await r.json();
-      if (r.ok && data.ok) renderChannelState(data);
+      if (!r.ok || !data.ok) throw new Error("Channel status unavailable");
+      renderChannelState(data);
       return data;
     } catch(e) {
+      for (const id of ["tg-profile-photo-status", "wa-profile-photo-status"]) {
+        const status = document.getElementById(id);
+        if (status.textContent) {
+          status.textContent = "No se pudo actualizar el estado de la foto. Reintentando.";
+          status.className = "mt-1 text-warning";
+        }
+      }
       return null;
     } finally {
       channelStateRequest = null;
@@ -1768,6 +1778,30 @@ function showTelegramPhotoOutcome(data) {
     status.className = "mt-1 " + (failed ? "text-warning" : "text-muted");
     if (failed) toast(data.profile_photo.message, "error");
   }
+}
+function showWhatsAppPhotoOutcome(data) {
+  const photo = data.identity && data.identity.profile_photo;
+  if (!photo) return;
+  const status = document.getElementById("wa-profile-photo-status");
+  status.textContent = photo.message;
+  const failed = ["failed", "missing", "uncertain"].includes(photo.status);
+  status.className = "mt-1 " + (failed ? "text-warning" : "text-muted");
+  if (failed) toast(photo.message, "error");
+}
+async function showTelegramWorkerStartFailure(data) {
+  if (!data.authorized || data.ok) return false;
+  clearTgAttempt();
+  tgAuthStatusActive = true;
+  document.getElementById("tg-api-hash").value = "";
+  for (const id of ["tg-code-section", "tg-2fa-section", "tg-switch-section"]) {
+    document.getElementById(id).style.display = "none";
+  }
+  document.getElementById("tg-link-status").textContent =
+    "Cuenta autorizada, pero el servicio no inició. Usa Reiniciar servicio TG.";
+  toast("La cuenta está autorizada; revisa el arranque de Telegram.", "error");
+  await loadChannelState(true);
+  showTelegramPhotoOutcome(data);
+  return true;
 }
 let tgAuthAttempt = sessionStorage.getItem("tg_auth_attempt") || null;
 let tgAuthMethod = sessionStorage.getItem("tg_auth_method") || "code";
@@ -2068,6 +2102,10 @@ async function linkTelegram() {
       body: JSON.stringify(payload)
     });
     const d = await r.json();
+    if (await showTelegramWorkerStartFailure(d)) {
+      btn.disabled = false;
+      return;
+    }
     if (d.needs_code) {
       if (d.auth_attempt) {
         rememberTgAttempt("link", d.auth_attempt);
@@ -2144,6 +2182,7 @@ async function verifyTgCode() {
       body: JSON.stringify({code, auth_attempt: tgAuthAttempt})
     });
     const d = await r.json();
+    if (!switching && await showTelegramWorkerStartFailure(d)) return;
     if (d.ok) {
       const wasSwitch = switching;
       clearTgAttempt();
@@ -2187,6 +2226,7 @@ async function verifyTgPassword() {
       body: JSON.stringify({password, auth_attempt: tgAuthAttempt})
     });
     const d = await r.json();
+    if (!switching && await showTelegramWorkerStartFailure(d)) return;
     if (d.ok) {
       const wasSwitch = switching;
       clearTgAttempt();
@@ -2459,7 +2499,15 @@ async function commitWaSwitch(generation) {
     document.getElementById("wa-qr-card").style.display = "none";
     document.getElementById("wa-link-status").innerHTML = "✅ Cuenta vinculada y verificada.";
     toast("✅ Cuenta de WhatsApp cambiada", "success");
+    const photo = d.identity && d.identity.profile_photo;
+    if (photo && photo.status !== "failed") showWhatsAppPhotoOutcome(d);
     await loadChannelState();
+    // Account activation and photo delivery have independent outcomes. Surface
+    // a queue error even when no request could be persisted for status polling.
+    if (photo && photo.status === "failed") {
+      if (d.message) document.getElementById("wa-link-status").textContent = d.message;
+      showWhatsAppPhotoOutcome(d);
+    }
   } catch(e) {
     stopWaSwitchPolling();
     setWaSwitchCancelDisabled(false);
@@ -2674,9 +2722,25 @@ body { background: #17212b; color: #e0e0e0; font-family: system-ui; margin: 0; p
 
 # ── API Routes ────────────────────────────────────────────────────────
 
+def _messages_transaction(handler):
+    """Serialize message/media read-modify-write in the panel's single worker.
+
+    Hold the same lock through file publication/removal and JSON persistence;
+    protecting only save would still allow an older snapshot to erase an upload.
+    Readers share this lock because schema normalization can also persist JSON.
+    """
+    @wraps(handler)
+    def serialized(*args, **kwargs):
+        with _messages_lock:
+            return handler(*args, **kwargs)
+    return serialized
+
+
+@_messages_transaction
 def load_messages_json():
     return load_message_file(MESSAGES_FILE, DEFAULT_MESSAGES_FILE, persist=True)
 
+@_messages_transaction
 def save_messages_json(data):
     MESSAGES_FILE.parent.mkdir(parents=True, exist_ok=True)
     temp_file = MESSAGES_FILE.with_suffix(".tmp")
@@ -3952,7 +4016,7 @@ def _read_tg_interaction_health() -> dict:
         raw.get("last_response"), {"call", "step1", "step2", "never"}, "never"
     )
     delivery = raw.get("delivery") if isinstance(raw.get("delivery"), dict) else {}
-    delivery_states = {"never", "pending", "sent", "failed", "missing", "skipped"}
+    delivery_states = {"never", "pending", "uploading", "sent", "uncertain", "failed", "missing", "skipped"}
     result["delivery"] = {
         key: _safe_enum(delivery.get(key), delivery_states, "never")
         for key in ("peer_resolution", "text", "audio", "video")
@@ -3975,6 +4039,7 @@ def api_tg_interaction_health():
     return response
 
 @app.route("/api/messages", methods=["POST"])
+@_messages_transaction
 def api_messages():
     data = request.get_json()
     if not data:
@@ -4152,6 +4217,7 @@ def _resolve_video_extension(filename: str) -> str | None:
 
 
 @app.route("/api/upload_call_audio", methods=["POST"])
+@_messages_transaction
 def api_upload_call_audio():
     """Sube audio para el mensaje de llamada."""
     if "audio" not in request.files:
@@ -4184,6 +4250,7 @@ def api_upload_call_audio():
     return jsonify({"ok": True, "filename": audio_filename, "path": str(audio_path)})
 
 @app.route("/api/upload_audio", methods=["POST"])
+@_messages_transaction
 def api_upload_audio():
     if "audio" not in request.files:
         return jsonify({"ok": False, "error": "No audio file"}), 400
@@ -4217,6 +4284,7 @@ def api_upload_audio():
 
 
 @app.route("/api/upload_call_video", methods=["POST"])
+@_messages_transaction
 def api_upload_call_video():
     """Sube video para el mensaje de llamada."""
     if "video" not in request.files:
@@ -4250,6 +4318,7 @@ def api_upload_call_video():
 
 
 @app.route("/api/upload_video", methods=["POST"])
+@_messages_transaction
 def api_upload_video():
     """Sube video para un paso de respuesta."""
     if "video" not in request.files:
@@ -4318,6 +4387,7 @@ def _upload_chunk_temp_key(lang: str, upload_type: str, step: int | None) -> str
 
 
 @app.route("/api/upload_chunk", methods=["POST"])
+@_messages_transaction
 def api_upload_chunk():
     """Recibe un chunk de audio o video. Cada chunk ≤ 500KB."""
     if "chunk" not in request.files:
@@ -4368,6 +4438,7 @@ def api_upload_assemble():
         return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
 
 
+@_messages_transaction
 def _do_upload_assemble():
     data = request.get_json()
     if not data:
@@ -4653,7 +4724,7 @@ def _queue_telegram_profile_picture(phone):
             not official_image_matches(_telegram_profile_image(), PROFILE_LOGO_PATH)):
         return _telegram_profile_status(phone)
     try:
-        return request_profile_picture(DATA_DIR, phone, _telegram_profile_image())
+        return request_profile_picture(DATA_DIR, phone, _telegram_profile_image(), new_link=True)
     except (OSError, ValueError):
         return {"status": "failed", "message": "La cuenta está vinculada, pero no se pudo preparar la actualización del logotipo."}
 
@@ -4675,6 +4746,10 @@ def _finish_telegram_auth(outcome):
     })
     session["channel_admin"] = True
     session.permanent = True
+    # Preserve the verified link intent even if starting the worker fails. A
+    # recovered worker may consume it only for this account and within its TTL.
+    if not public.get("already_authorized"):
+        public["profile_photo"] = _queue_telegram_profile_picture(phone)
     started, message = restart_telegram_worker()
     public.update({
         "ok": started,
@@ -4684,8 +4759,6 @@ def _finish_telegram_auth(outcome):
     })
     if not started:
         public["error"] = message
-    elif not public.get("already_authorized"):
-        public["profile_photo"] = _queue_telegram_profile_picture(phone)
     return public
 
 

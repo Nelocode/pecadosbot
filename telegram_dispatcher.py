@@ -74,20 +74,19 @@ async def deliver_telegram_response_components(
     idempotent at Telegram's MTProto boundary.
     """
 
-    if response_key != "call":
-        for sender in (send_text, send_audio, send_video):
-            if sender is not None:
-                await sender()
-        return
-
     first_error: Exception | None = None
-    for sender in (send_audio, send_video, send_text):
+    senders = (
+        (send_audio, send_video, send_text)
+        if response_key == "call"
+        else (send_text, send_audio, send_video)
+    )
+    for sender in senders:
         if sender is None:
             continue
         try:
             await sender()
         except Exception as exc:
-            # A missing/failed media must not suppress the useful call text.
+            # A failed component must not suppress the remaining configured media.
             # Re-raising after all attempts keeps the interaction uncommitted,
             # allowing the stable component random_ids to make retries safe.
             if first_error is None:

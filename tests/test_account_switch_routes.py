@@ -775,7 +775,8 @@ class AccountSwitchRoutesTestCase(unittest.TestCase):
                 "delivery": {
                     "peer_resolution": "sent",
                     "text": "sent",
-                    "audio": "sent",
+                    "audio": "uploading",
+                    "video": "uncertain",
                 },
                 "caller_id": secret_id,
                 "message": "private content",
@@ -809,7 +810,8 @@ class AccountSwitchRoutesTestCase(unittest.TestCase):
         self.assertEqual("processed", data["service_call_status"])
         self.assertEqual("update_entities", data["service_peer_source"])
         self.assertEqual("healthy", data["missed_call_poll"])
-        self.assertEqual("sent", data["delivery"]["audio"])
+        self.assertEqual("uploading", data["delivery"]["audio"])
+        self.assertEqual("uncertain", data["delivery"]["video"])
 
 
 if __name__ == "__main__":

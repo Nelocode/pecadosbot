@@ -1,16 +1,29 @@
-"""Panel callbacks queue a photo only for a newly verified, active account."""
+"""Panel callbacks queue a photo only for a newly verified account."""
+import asyncio
 from contextlib import ExitStack
 import hashlib
 import json
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import app as app_module
+import telegram_profile_picture as pictures
 from telegram_auth import AuthOutcome
 from telegram_profile_picture import REQUEST_FILE
+
+
+class FakeTelegramPhotoClient:
+    def __init__(self):
+        self.upload_file = AsyncMock(return_value="uploaded-fixture")
+        self.apply = AsyncMock(return_value=SimpleNamespace(photo=SimpleNamespace(id=42)))
+        self.get_profile_photos = AsyncMock(return_value=[SimpleNamespace(id=42)])
+
+    async def __call__(self, request):
+        return await self.apply(request)
 
 
 class ProfilePhotoIntegrationTests(unittest.TestCase):
@@ -58,6 +71,22 @@ class ProfilePhotoIntegrationTests(unittest.TestCase):
                 response = app_module._finish_telegram_switch(outcome)
         return response, promote
 
+    def poll_photo_once(self, client, *, phone=None):
+        """Run the real consumer for one iteration with a mocked provider."""
+        me = SimpleNamespace(phone=phone or self.PHONE, bot=False, id=123)
+
+        async def consume():
+            with (
+                patch.object(pictures, "_photo_request", return_value="photo-request-fixture"),
+                patch.object(pictures.asyncio, "sleep", side_effect=asyncio.CancelledError),
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await pictures.poll_profile_picture_requests(
+                        client, me, self.data_dir, self.logo, canonical_image_path=self.logo,
+                    )
+
+        asyncio.run(consume())
+
     def assert_public_without_identity(self, response):
         encoded = json.dumps(response)
         for private in (self.PHONE, self.PHONE.lstrip("+"), self.API_HASH,
@@ -71,7 +100,7 @@ class ProfilePhotoIntegrationTests(unittest.TestCase):
         self.assertTrue(response["authorized"])
         self.assertTrue(authorized)
         self.assertEqual("pending", response["profile_photo"]["status"])
-        self.request_photo.assert_called_once_with(self.data_dir, self.PHONE, self.logo)
+        self.request_photo.assert_called_once_with(self.data_dir, self.PHONE, self.logo, new_link=True)
         request = json.loads((self.data_dir / REQUEST_FILE).read_text(encoding="utf-8"))
         self.assertEqual(hashlib.sha256(self.PHONE.lstrip("+").encode()).hexdigest(), request["account_hash"])
         self.assertEqual(hashlib.sha256(self.logo.read_bytes()).hexdigest(), request["image_hash"])
@@ -100,16 +129,75 @@ class ProfilePhotoIntegrationTests(unittest.TestCase):
         self.request_photo.assert_not_called()
         self.assertFalse((self.data_dir / REQUEST_FILE).exists())
 
-    def test_failed_worker_keeps_verified_auth_but_does_not_queue_photo(self):
+    def test_failed_worker_keeps_verified_auth_and_pending_photo_for_recovery(self):
         self.restart.return_value = (False, "worker unavailable")
         response, authorized = self.finish_auth(self.outcome())
         self.assertFalse(response["ok"])
         self.assertTrue(response["authorized"])
         self.assertTrue(authorized)
         self.assertFalse(response["worker_starting"])
-        self.assertNotIn("profile_photo", response)
-        self.request_photo.assert_not_called()
+        self.assertEqual("pending", response["profile_photo"]["status"])
+        self.request_photo.assert_called_once_with(self.data_dir, self.PHONE, self.logo, new_link=True)
+        self.assertTrue((self.data_dir / REQUEST_FILE).is_file())
         self._write_telegram_authorized_marker.assert_called_once_with()
+
+    def test_recovered_worker_consumes_original_request_without_requeue_or_duplicate_photo(self):
+        self.restart.return_value = (False, "worker unavailable")
+        response, _ = self.finish_auth(self.outcome())
+        self.assertFalse(response["ok"])
+        self.assertEqual("pending", response["profile_photo"]["status"])
+        request_path = self.data_dir / REQUEST_FILE
+        original_request = json.loads(request_path.read_text(encoding="utf-8"))
+
+        self.restart.return_value = (True, "ready")
+        browser = app_module.app.test_client()
+        csrf = "t" * 48
+        with browser.session_transaction() as browser_session:
+            browser_session["channel_csrf"] = csrf
+            browser_session["channel_admin"] = True
+        with (
+            patch.object(app_module, "_telegram_session_is_authorized", return_value=True),
+            patch.object(app_module, "_can_manage_channels", return_value=True),
+            patch.object(app_module, "bot_is_running", return_value=False),
+        ):
+            recovered = browser.post("/api/link_telegram", json={}, headers={"X-Channel-CSRF": csrf})
+        self.assertEqual(200, recovered.status_code)
+        self.assertTrue(recovered.get_json()["already_authorized"])
+        self.assertTrue(recovered.get_json()["worker_starting"])
+        self.request_photo.assert_called_once_with(self.data_dir, self.PHONE, self.logo, new_link=True)
+        self.assertEqual(original_request, json.loads(request_path.read_text(encoding="utf-8")))
+
+        client = FakeTelegramPhotoClient()
+        self.poll_photo_once(client, phone="+570000000002")
+        client.upload_file.assert_not_awaited()
+        self.assertFalse((self.data_dir / pictures.RESULTS_DIR).exists())
+        self.assertEqual("pending", app_module._telegram_profile_status(self.PHONE)["status"])
+
+        self.poll_photo_once(client)
+        self.assertEqual("applied", app_module._telegram_profile_status(self.PHONE)["status"])
+        self.poll_photo_once(client)
+        client.upload_file.assert_awaited_once()
+        client.apply.assert_awaited_once()
+        client.get_profile_photos.assert_awaited_once()
+        self.assertEqual(original_request, json.loads(request_path.read_text(encoding="utf-8")))
+        self.request_photo.assert_called_once()
+
+    def test_another_verified_link_reapplies_instead_of_returning_old_success(self):
+        self.finish_auth(self.outcome())
+        client = FakeTelegramPhotoClient()
+        self.poll_photo_once(client)
+        self.assertEqual("applied", app_module._telegram_profile_status(self.PHONE)["status"])
+        request_path = self.data_dir / REQUEST_FILE
+        original_id = json.loads(request_path.read_text(encoding="utf-8"))["request_id"]
+
+        response, _ = self.finish_auth(self.outcome())
+        self.assertEqual("pending", response["profile_photo"]["status"])
+        self.assertNotEqual(original_id, json.loads(request_path.read_text(encoding="utf-8"))["request_id"])
+        self.assertEqual("pending", app_module._telegram_profile_status(self.PHONE)["status"])
+        self.poll_photo_once(client)
+        self.assertEqual("applied", app_module._telegram_profile_status(self.PHONE)["status"])
+        self.assertEqual(2, client.apply.await_count)
+        self.assertEqual(2, client.get_profile_photos.await_count)
 
     def test_photo_storage_failure_does_not_undo_successful_auth(self):
         self.request_photo.side_effect = OSError("private storage detail")
@@ -148,7 +236,7 @@ class ProfilePhotoIntegrationTests(unittest.TestCase):
         promote.assert_called_once_with(self.API_ID, self.API_HASH, self.PHONE)
         self.assertTrue(response["switched"])
         self.assertEqual("pending", response["profile_photo"]["status"])
-        self.request_photo.assert_called_once_with(self.data_dir, self.PHONE, self.logo)
+        self.request_photo.assert_called_once_with(self.data_dir, self.PHONE, self.logo, new_link=True)
         self.assert_public_without_identity(response)
 
     def test_failed_promotion_keeps_previous_account_and_never_queues(self):

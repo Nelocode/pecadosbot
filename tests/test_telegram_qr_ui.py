@@ -12,11 +12,15 @@ import app as app_module
 
 @unittest.skipUnless(shutil.which("node"), "Node.js no está disponible")
 class TelegramQrUiTestCase(unittest.TestCase):
-    def run_ui(self, scenario):
+    def run_ui(self, scenario, *, real_status_loader=False):
         template = app_module.TEMPLATE
         render = template[template.index("function renderChannelState("):template.index("async function loadChannelState(")]
         auth = template[template.index("let tgRetryTimer ="):template.index("function showTelegramSwitch(")]
         code = render + "\n" + auth
+        code += template[template.index("async function linkTelegram("):template.index("async function cancelTgAuth(")]
+        code += template[template.index("async function commitWaSwitch("):template.index("async function cancelWaSwitch(")]
+        if real_status_loader:
+            code += template[template.index("async function loadChannelState("):template.index("async function showSetup(")]
         harness = r"""
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
@@ -43,9 +47,11 @@ const context = vm.createContext({
   loadChannelState: async () => {}, channelHeaders: () => ({}),
   toast(message, type) { notifications.push({message, type}); }, setAdminAccessStatus() {}, loadTestMode() {}, renderTestModeState() {},
   safeAccountLabel: () => 'Cuenta', revealWaQrCard() {}, beginWaSwitchPolling() {},
-  waSwitchPolling: false, fetch: async () => { throw new Error('unexpected network'); }
+  waSwitchPolling: false, waSwitchGeneration: 1, waCommitInFlight: true,
+  stopWaSwitchPolling() {}, setWaSwitchCancelDisabled() {},
+  fetch: async () => { throw new Error('unexpected network'); }
 });
-vm.runInContext('let channelState = null; let channelCsrf = "test"; let tgAuthMode = "link";', context);
+vm.runInContext('let channelState = null; let channelStateRequest = null; let channelCsrf = "test"; let tgAuthMode = "link";', context);
 vm.runInContext(CODE, context);
 const run = code => vm.runInContext(code, context);
 (async () => { SCENARIO })().catch(error => { console.error(error); process.exitCode = 1; });
@@ -152,6 +158,63 @@ run(`renderChannelState({can_manage:true,
   telegram:{linked:true, profile_photo:{status:'pending', message:'Nueva cuenta pendiente'}}, whatsapp:{}})`);
 assert.equal(element('tg-profile-photo-status').textContent, 'Nueva cuenta pendiente');
 assert.doesNotMatch(element('tg-profile-photo-status').className, /text-warning/);
+""")
+
+    def test_wa_link_success_does_not_hide_photo_queue_failure(self):
+        self.run_ui(r"""
+context.waSwitchPolling = true;
+context.loadChannelState = async () => {
+  element('wa-profile-photo-status').textContent = 'Old confirmation';
+  element('wa-profile-photo-status').className = 'text-success';
+};
+context.fetch = async () => ({ok:true, json:async () => ({ok:true,
+  message:'Account linked; photo request could not be saved',
+  identity:{profile_photo:{status:'failed', message:'Photo queue storage failed'}}})});
+await run('commitWaSwitch(1)');
+assert.equal(element('wa-profile-photo-status').textContent, 'Photo queue storage failed');
+assert.match(element('wa-profile-photo-status').className, /text-warning/);
+assert.equal(element('wa-link-status').textContent, 'Account linked; photo request could not be saved');
+assert.equal(notifications.at(-1).type, 'error');
+assert.equal(notifications.at(-1).message, 'Photo queue storage failed');
+""")
+
+    def test_failed_poll_invalidates_old_photo_confirmation_and_recovers(self):
+        self.run_ui(r"""
+element('tg-profile-photo-status').textContent = 'Old confirmation';
+element('tg-profile-photo-status').className = 'text-success';
+context.fetch = async () => { throw new Error('offline'); };
+assert.equal(await run('loadChannelState()'), null);
+assert.doesNotMatch(element('tg-profile-photo-status').textContent, /Old confirmation/);
+assert.match(element('tg-profile-photo-status').className, /text-warning/);
+assert.equal(element('wa-profile-photo-status').textContent, '');
+context.fetch = async () => ({ok:true, json:async () => ({ok:true, can_manage:true,
+  telegram:{linked:true, profile_photo:{status:'pending',message:'Fresh pending'}}, whatsapp:{}})});
+await run('loadChannelState()');
+assert.equal(element('tg-profile-photo-status').textContent, 'Fresh pending');
+assert.doesNotMatch(element('tg-profile-photo-status').className, /text-warning/);
+""", real_status_loader=True)
+
+    def test_code_and_password_show_authorized_worker_failure_and_photo_error(self):
+        self.run_ui(r"""
+for (const [method, input] of [['linkTelegram', 'tg-phone'], ['verifyTgCode', 'tg-code-input'], ['verifyTgPassword', 'tg-password-input']]) {
+  run("rememberTgAttempt('link', 'owned-token');");
+  element(input).value = 'synthetic authentication input';
+  element('tg-api-hash').value = 'synthetic private value';
+  element('tg-api-id').value = '123456';
+  element('tg-phone').value = '+570000000000';
+  context.fetch = async () => ({ok:true, json:async () => ({ok:false, authorized:true,
+    error:'worker unavailable', profile_photo:{status:'failed', message:'Photo queue unavailable'}})});
+  await run(method + '()');
+  assert.equal(run('tgAuthAttempt'), null);
+  assert.equal(run('tgAuthBusy'), false);
+  assert.equal(element('tg-api-hash').value, '');
+  assert.equal(element('tg-code-section').style.display, 'none');
+  assert.equal(element('tg-2fa-section').style.display, 'none');
+  assert.match(element('tg-link-status').textContent, /autorizada/);
+  assert.equal(element('tg-profile-photo-status').textContent, 'Photo queue unavailable');
+  assert.equal(notifications.at(-1).type, 'error');
+}
+assert.ok(notifications.every(notification => notification.type !== 'success'));
 """)
 
 

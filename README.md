@@ -23,14 +23,19 @@ una sesión ya autorizada o consultar el panel no crea solicitudes de foto.
 El worker exige que el teléfono de su sesión coincida con la solicitud y verifica
 que la primera foto devuelta por Telegram tenga el ID de la foto recién subida.
 La petición caduca en diez minutos. Un resultado incierto no se reintenta solo.
-Las aplicaciones confirmadas se deduplican por cuenta y logo. El estado muestra
-la última aplicación comprobada; no vigila cambios manuales posteriores del perfil.
+Cada vinculación nueva solicita otra aplicación, aunque exista un éxito anterior
+para esa cuenta y logo. Una solicitud pendiente no se duplica. Si el arranque
+del worker falla tras verificar una cuenta nueva, se conserva la solicitud durante
+sus diez minutos de validez para que pueda consumirla al recuperarse. El estado
+muestra la última operación comprobada; no vigila cambios manuales posteriores.
 
 WhatsApp solicita la foto únicamente después de promover y comprobar en línea
 una cuenta vinculada desde este panel. La petición identifica PecadosVIP, la
 cuenta y el hash del logo y caduca en diez minutos. Abrir una sesión existente
 no crea esa petición; los candidatos `WA_LINK_ONLY` tampoco cambian la foto.
-El estado se guarda por cuenta y hash del logo. Una confirmación significa que
+El estado se guarda por cuenta, hash del logo e identificador de solicitud. Una
+vinculación nueva puede reaplicar el logo; una reconexión de la misma solicitud
+no repite una actualización confirmada. Una confirmación significa que
 WhatsApp aceptó la operación; no es una
 comparación visual de la imagen remota. Una desconexión o tiempo de espera agotado
 se muestra como incierto y no provoca un reintento automático. Se conserva la
@@ -51,6 +56,23 @@ No eliminar los archivos de estado para forzar reintentos: primero verificar el
 resultado remoto cuando el estado sea incierto. La comprobación final requiere
 una vinculación autorizada con cada proveedor; las pruebas locales usan clientes
 simulados y no cambian perfiles reales.
+
+## Vídeos y audios opcionales en Telegram
+
+Un campo `audio: ""` omite el audio y permite enviar el texto y el vídeo del paso
+o llamada. Los campos ausentes o inválidos conservan sus valores predeterminados.
+No se borran nombres de audio existentes: si se configuró un archivo que falta,
+se informa del error y se intentan los demás componentes. La interacción solo se
+confirma al completar todos los componentes configurados; mientras no se repare
+el archivo faltante, una interacción nueva puede volver a utilizar ese paso.
+
+La subida de medios tiene un presupuesto separado del envío MTProto. Los
+reintentos conservan el identificador del evento y componente para evitar
+duplicados; agotar el tiempo de envío deja un resultado incierto, nunca un éxito
+inventado. Los guardados de mensajes y medios del panel se serializan para
+conservar referencias de vídeo ante operaciones simultáneas en los cuatro hilos
+del único proceso Gunicorn declarado en `entrypoint.sh`. Esto no coordina varios
+procesos o instancias que compartan datos; esas instancias deben seguir aisladas.
 
 ## Separación de instancias y marcas
 
