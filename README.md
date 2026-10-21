@@ -1,5 +1,15 @@
 # Bot AutoReply Madrid
 
+## Pruebas sin servicios externos
+
+En un checkout limpio, instala `requirements.txt`, `pytest>=9,<10` y las
+dependencias Node mediante `npm ci --ignore-scripts --include=optional`.
+Ejecuta `python scripts/run_offline_tests.py` y
+`node --import ./scripts/offline_node_guard.mjs --test tests/*.test.mjs`.
+Los runners bloquean conexiones con proveedores y el inicio de workers;
+no deben ejecutarse sobre una carpeta con sesiones productivas. GitHub Actions
+ejecuta estas comprobaciones con Python 3.12 y Node 20, sin secretos de despliegue.
+
 ## Logotipo de PecadosVIP al vincular cuentas
 
 El panel muestra `assets/pecadosvip-profile-logo.png`, el logotipo oficial existente
