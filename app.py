@@ -4,6 +4,7 @@ Flask webapp para gestionar mensajes y audios del bot.
 """
 import os
 import json
+import math
 import hashlib
 import hmac
 import shutil
@@ -11,6 +12,7 @@ import re
 import secrets
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -3793,7 +3795,7 @@ def _read_wa_call_health(file_path: Path = WA_CALL_HEALTH_FILE):
 
     pipeline = raw.get("pipeline") if isinstance(raw.get("pipeline"), dict) else {}
     delivery = {
-        "sent", "failed", "uncertain", "missing", "skipped", "skipped_offline",
+        "sent", "failed", "uncertain", "missing", "skipped", "skipped_offline", "held",
         "not_applicable", "never"
     }
     result["pipeline"] = {
@@ -4024,7 +4026,7 @@ def _read_tg_interaction_health() -> dict:
         raw.get("last_response"), {"call", "step1", "step2", "never"}, "never"
     )
     delivery = raw.get("delivery") if isinstance(raw.get("delivery"), dict) else {}
-    delivery_states = {"never", "pending", "uploading", "sent", "uncertain", "failed", "missing", "skipped"}
+    delivery_states = {"never", "pending", "uploading", "sent", "uncertain", "failed", "missing", "skipped", "held"}
     result["delivery"] = {
         key: _safe_enum(delivery.get(key), delivery_states, "never")
         for key in ("peer_resolution", "text", "audio", "video")
@@ -4045,6 +4047,136 @@ def api_tg_interaction_health():
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
     return response
+
+_DELIVERY_TIMING_MAX_SNAPSHOT_BYTES = 256 * 1024
+_DELIVERY_TIMING_MAX_SAMPLES = 32
+_DELIVERY_TIMING_DURATION_FIELDS = (
+    "queue_ms", "prepare_ms", "upload_ms", "rpc_ms", "total_ms",
+    "pacing_ms", "sdk_ms", "ack_ms", "presentation_ms", "elapsed_ms",
+)
+_DELIVERY_TIMING_OUTCOMES = frozenset({
+    "sent", "completed", "failed", "uncertain", "blocked", "cancelled",
+    "missing", "skipped", "held",
+})
+
+
+def _read_delivery_timing_snapshot(filename):
+    """Read one bounded, regular snapshot owned by the validated data directory."""
+    try:
+        data_root = DATA_DIR.absolute()
+        if data_root.resolve(strict=True) != data_root:
+            return None
+        path = data_root / filename
+        if path.resolve(strict=True) != path:
+            return None
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _DELIVERY_TIMING_MAX_SNAPSHOT_BYTES:
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            # Reject replacements between validation and open, also on Windows
+            # where O_NOFOLLOW is unavailable. Do not read a redirected file.
+            if (not stat.S_ISREG(opened.st_mode)
+                    or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+                    or path.resolve(strict=True) != path):
+                return None
+            content = os.read(descriptor, _DELIVERY_TIMING_MAX_SNAPSHOT_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        if len(content) > _DELIVERY_TIMING_MAX_SNAPSHOT_BYTES:
+            return None
+        snapshot = json.loads(content)
+        if (not isinstance(snapshot, dict)
+                or type(snapshot.get("schema_version")) is not int
+                or snapshot["schema_version"] != 1):
+            return None
+        return snapshot
+    except (OSError, ValueError, TypeError, RuntimeError, RecursionError):
+        return None
+
+
+def _delivery_timing_number(value, maximum):
+    if type(value) not in (int, float):
+        return None
+    try:
+        return value if math.isfinite(value) and 0 <= value <= maximum else None
+    except OverflowError:
+        return None
+
+
+def _delivery_timing_metrics(raw):
+    result = {"outcome": _safe_enum(raw.get("outcome"), _DELIVERY_TIMING_OUTCOMES, "unknown")}
+    for name in _DELIVERY_TIMING_DURATION_FIELDS:
+        if name in raw:
+            result[name] = _delivery_timing_number(raw[name], 3_600_000)
+    for name in ("size_bytes", "video_bytes"):
+        if name in raw:
+            value = raw[name]
+            result[name] = value if type(value) is int and 0 <= value <= 2**53 - 1 else None
+    for name in ("cache_hit", "video_cache_hit"):
+        if name in raw:
+            result[name] = raw[name] if type(raw[name]) is bool else None
+    return result
+
+
+def _public_delivery_timing_sample(raw, *, timestamp_scale):
+    if not isinstance(raw, dict):
+        return None
+    trace_id = raw.get("trace_id")
+    # Worker-generated UUID4 only; never expose provider/account/event identifiers.
+    if (not isinstance(trace_id, str)
+            or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", trace_id)):
+        return None
+    observed = _delivery_timing_number(raw.get("observed_at"), 253402300799 * timestamp_scale)
+    result = {
+        "trace_id": trace_id,
+        "observed_at": observed / timestamp_scale if observed is not None else None,
+        "response": _safe_enum(raw.get("response"), {"step1", "step2", "call"}, None),
+        **_delivery_timing_metrics(raw),
+    }
+    if isinstance(raw.get("components"), dict):
+        result["components"] = {
+            name: _delivery_timing_metrics(raw["components"][name])
+            for name in ("video", "text", "audio")
+            if isinstance(raw["components"].get(name), dict)
+        }
+    return result
+
+
+@app.route("/api/delivery_timing")
+def api_delivery_timing():
+    """Passive diagnostic only: no configuration, session, provider or worker actions."""
+    channels = {}
+    for channel, filename, scale in (
+        ("telegram", "tg_interaction_health.json", 1),
+        ("whatsapp", "wa_delivery_timing.json", 1000),
+    ):
+        snapshot = _read_delivery_timing_snapshot(filename)
+        raw_samples = []
+        if snapshot is not None:
+            if channel == "telegram" and isinstance(snapshot.get("telemetry"), dict):
+                raw_samples = [snapshot["telemetry"]]
+            elif channel == "whatsapp" and isinstance(snapshot.get("samples"), list):
+                raw_samples = snapshot["samples"][-_DELIVERY_TIMING_MAX_SAMPLES:]
+        samples = [
+            sample for raw in raw_samples
+            if (sample := _public_delivery_timing_sample(raw, timestamp_scale=scale)) is not None
+        ]
+        channels[channel] = {"available": bool(samples), "samples": samples}
+    response = jsonify({
+        "ok": True, "schema_version": 1,
+        "observed_at_unit": "unix_seconds", "duration_unit": "milliseconds",
+        **channels,
+    })
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
 
 @app.route("/api/messages", methods=["POST"])
 @_messages_transaction

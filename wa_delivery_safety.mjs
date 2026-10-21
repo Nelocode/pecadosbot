@@ -183,6 +183,8 @@ export function createWhatsAppDeliverySafety({
   random = Math.random,
   sleep = defaultSleep,
   logger = console,
+  timing = null,
+  monotonicNow = () => performance.now(),
 } = {}) {
   if (typeof sendMessage !== 'function') throw new TypeError('sendMessage is required');
   if (!health || typeof health.record !== 'function') throw new TypeError('health is required');
@@ -195,6 +197,44 @@ export function createWhatsAppDeliverySafety({
   let sendGate = Promise.resolve();
   let cancellationRevision = 0;
   let pendingSends = 0;
+  let presenceRevision = 0;
+  let activePresence = null;
+
+  function beginTiming(content, context) {
+    const startedAt = monotonicNow();
+    let recorded = false;
+    const sample = {
+      trace_id: context?.trace_id,
+      response: context?.response,
+      component: typeof content?.text === 'string' ? 'text'
+        : content?.audio ? 'audio' : content?.video ? 'video' : 'other',
+      queue_ms: null,
+      pacing_ms: null,
+      sdk_ms: null,
+    };
+    return {
+      sample,
+      elapsed: since => Math.max(0, monotonicNow() - since),
+      queued: () => { sample.queue_ms = Math.max(0, monotonicNow() - startedAt); },
+      finish(outcome) {
+        if (recorded) return;
+        recorded = true;
+        try {
+          timing?.record({ ...sample, outcome, total_ms: Math.max(0, monotonicNow() - startedAt) });
+        } catch {
+          // Diagnostics never change delivery or retry an attempted send.
+        }
+      },
+    };
+  }
+
+  function timingOutcome(error) {
+    if (error?.message === 'send_timeout') return 'uncertain';
+    if (error instanceof WhatsAppDeliveryBlockedError) {
+      return TRANSPORT_RELEASE_REASONS.has(error.code) ? 'cancelled' : 'blocked';
+    }
+    return 'failed';
+  }
 
   function jittered(value) {
     if (value <= 0 || config.jitterRatio <= 0) return Math.max(0, Math.round(value));
@@ -294,13 +334,75 @@ export function createWhatsAppDeliverySafety({
       const base = Math.min(Math.max(estimated, config.audioDelayMinMs), config.audioDelayMaxMs);
       return { presence: 'recording', delay: jittered(base) };
     }
-    if (content?.video) {
-      const bytes = Buffer.isBuffer(content.video) ? content.video.length : 0;
-      const estimated = bytes > 0 ? (bytes / 64_000) * 1000 : config.audioDelayMinMs;
-      const base = Math.min(Math.max(estimated, config.audioDelayMinMs), config.audioDelayMaxMs);
-      return { presence: 'composing', delay: jittered(base) };
-    }
+    if (content?.video) return { presence: 'composing', delay: 0, concurrent: true };
     return { presence: null, delay: 0 };
+  }
+
+  function startVideoPresence(jid, signal) {
+    const revision = ++presenceRevision;
+    activePresence = { jid, revision };
+    let stopped = false;
+    let updates = 0;
+    let compensated = false;
+    let renewalTimer;
+    let expiryTimer;
+    const publish = async presence => {
+      let attempted = false;
+      let timedOut = false;
+      const providerPromise = Promise.resolve().then(() => {
+        if (presence === 'composing' && (stopped || signal.aborted)) return;
+        if (controlState().delivery_blocked) return;
+        if (presence === 'composing' && revision !== presenceRevision) return;
+        if (presence === 'paused' && activePresence?.jid === jid && activePresence.revision !== revision) return;
+        attempted = true;
+        return sendPresenceUpdate(presence, jid);
+      });
+      if (presence === 'composing') {
+        void providerPromise.then(() => {
+          if (attempted && stopped && !compensated) {
+            compensated = true;
+            void publish('paused').catch(() => {});
+          }
+        }, error => {
+          if (timedOut) registerProviderSignal(error);
+        }).catch(() => {});
+      }
+      try {
+        await settleWithTimeout(providerPromise, config.auxiliaryTimeoutMs, 'presence');
+        return true;
+      } catch (error) {
+        timedOut = error?.message === 'presence_timeout';
+        registerProviderSignal(error);
+        logger.warn?.('[WA SAFETY] Video presence update could not be sent');
+        return false;
+      }
+    };
+    const stop = () => {
+      if (stopped) return;
+      stopped = true;
+      clearTimeout(renewalTimer);
+      clearTimeout(expiryTimer);
+      signal.removeEventListener('abort', stop);
+      if (activePresence?.revision === revision) activePresence = null;
+      // Cleanup is best effort and never delays the next component. Provider
+      // restrictions still prevent additional presence traffic.
+      if (!controlState().delivery_blocked) void publish('paused').catch(() => {});
+    };
+    const pulse = async () => {
+      if (stopped || signal.aborted || controlState().delivery_blocked) return stop();
+      updates += 1;
+      if (!await publish('composing')) return stop();
+      if (stopped || signal.aborted || controlState().delivery_blocked) return stop();
+      if (updates < 6) {
+        renewalTimer = setTimeout(() => { void pulse().catch(() => stop()); }, 5_000);
+        renewalTimer.unref?.();
+      }
+    };
+    signal.addEventListener('abort', stop, { once: true });
+    expiryTimer = setTimeout(stop, Math.min(config.sendTimeoutMs, 30_000));
+    expiryTimer.unref?.();
+    void pulse().catch(() => stop());
+    return stop;
   }
 
   function registerFailure(error) {
@@ -349,18 +451,24 @@ export function createWhatsAppDeliverySafety({
     if (remaining > 0) await waitInterruptibly(remaining, signal);
   }
 
-  async function sendSerialized(jid, content) {
+  async function sendSerialized(jid, content, deliveryTiming) {
     const controller = controllerForOperation();
     const pacing = pacingFor(content);
     let transportController = null;
+    let stopVideoPresence = null;
+    let presenceOwner = null;
+    const pacingStartedAt = monotonicNow();
     try {
       await enforceRateLimit(controller.signal);
       if (
         config.presenceEnabled
         && pacing.presence
+        && !pacing.concurrent
         && !controller.signal.aborted
         && !controlState().delivery_blocked
       ) {
+        presenceOwner = ++presenceRevision;
+        activePresence = { jid, revision: presenceOwner };
         try {
           await settleWithTimeout(
             sendPresenceUpdate(pacing.presence, jid),
@@ -377,22 +485,31 @@ export function createWhatsAppDeliverySafety({
       }
 
       assertDeliveryAllowed();
+      deliveryTiming.sample.pacing_ms = deliveryTiming.elapsed(pacingStartedAt);
+      if (config.presenceEnabled && pacing.concurrent) {
+        stopVideoPresence = startVideoPresence(jid, controller.signal);
+      }
       lastSendStartedAt = now();
       transportController = new AbortController();
       transportControllers.add(transportController);
       const transportPromise = Promise.resolve().then(() => sendMessage(jid, content));
+      const sdkStartedAt = monotonicNow();
       try {
         const result = await settleWithTimeout(
           transportPromise,
           config.sendTimeoutMs,
           'send',
         );
+        deliveryTiming.sample.sdk_ms = deliveryTiming.elapsed(sdkStartedAt);
         consecutiveFailures = 0;
         backoffAttempt = 0;
         health.record('outgoing');
         return result;
       } catch (error) {
+        deliveryTiming.sample.sdk_ms = deliveryTiming.elapsed(sdkStartedAt);
         if (error?.message === 'send_timeout') {
+          stopVideoPresence?.();
+          deliveryTiming.finish('uncertain');
           // Baileys does not expose cancellation for an in-flight send. Keep
           // the global gate occupied until the transport settles or this
           // socket is explicitly cancelled, otherwise a late delivery could
@@ -414,9 +531,14 @@ export function createWhatsAppDeliverySafety({
         throw error;
       }
     } finally {
+      stopVideoPresence?.();
+      if (deliveryTiming.sample.pacing_ms === null) {
+        deliveryTiming.sample.pacing_ms = deliveryTiming.elapsed(pacingStartedAt);
+      }
       if (
         config.presenceEnabled
         && pacing.presence
+        && !pacing.concurrent
         && !controller.signal.aborted
         && !controlState().delivery_blocked
       ) {
@@ -432,18 +554,24 @@ export function createWhatsAppDeliverySafety({
         }
       }
       if (transportController) transportControllers.delete(transportController);
+      if (activePresence?.revision === presenceOwner) activePresence = null;
       releaseController(controller);
     }
   }
 
-  function send(jid, content) {
+  function send(jid, content, context = null) {
+    const deliveryTiming = beginTiming(content, context);
     try {
       assertDeliveryAllowed();
     } catch (error) {
+      deliveryTiming.queued();
+      deliveryTiming.finish(timingOutcome(error));
       return Promise.reject(error);
     }
     if (pendingSends >= config.maxPendingSends) {
       health.record('local_rate_limit');
+      deliveryTiming.queued();
+      deliveryTiming.finish('blocked');
       return Promise.reject(new WhatsAppDeliveryBlockedError('queue_full'));
     }
     pendingSends += 1;
@@ -454,6 +582,7 @@ export function createWhatsAppDeliverySafety({
     sendGate = new Promise(resolve => { release = resolve; });
     return (async () => {
       await previous;
+      deliveryTiming.queued();
       try {
         if (expectedRevision !== cancellationRevision) {
           throw new WhatsAppDeliveryBlockedError('operation_cancelled');
@@ -462,8 +591,12 @@ export function createWhatsAppDeliverySafety({
           health.record('local_rate_limit');
           throw new WhatsAppDeliveryBlockedError('queue_timeout');
         }
-        return await sendSerialized(jid, content);
+        return await sendSerialized(jid, content, deliveryTiming);
+      } catch (error) {
+        deliveryTiming.finish(deliveryTiming.sample.sdk_ms === null ? timingOutcome(error) : 'uncertain');
+        throw error;
       } finally {
+        deliveryTiming.finish('completed');
         pendingSends -= 1;
         release();
       }

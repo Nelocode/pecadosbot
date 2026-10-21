@@ -1,4 +1,5 @@
 import { jidNormalizedUser } from '@whiskeysockets/baileys';
+import { randomUUID } from 'node:crypto';
 import { settleWithTimeout } from './keyed_serial_queue.mjs';
 import { toWhatsAppAudioContent, toWhatsAppVideoContent } from './wa_audio_delivery.mjs';
 import { provisionalLanguageFromWhatsAppIdentity } from './whatsapp_language_hint.mjs';
@@ -251,6 +252,7 @@ export function createWhatsAppCallHandler({
               contactAliases,
             ),
           });
+          if (interactionDecision?.persisted === false) throw new Error('interaction_state_not_persisted');
         }
         return { contactId, interactionDecision };
       });
@@ -298,6 +300,7 @@ export function createWhatsAppCallHandler({
 
     const deliveryKey = interactionDecision?.contactKey || claimed.contactId;
     const delivery = await serializeInteraction(deliveryKey, async () => {
+      const deliveryContext = { trace_id: randomUUID(), response: 'call' };
       const result = {
         status: 'handled',
         callId: call.id,
@@ -356,16 +359,22 @@ export function createWhatsAppCallHandler({
         }
         try {
           await settleWithTimeout(
-            Promise.resolve(sendMessage(replyJid, content)),
+            Promise.resolve(sendMessage(replyJid, content, deliveryContext)),
             sendTimeoutMs,
             `El envío de ${component} de la llamada`,
           );
           result[component] = 'sent';
         } catch {
-          // Sending may have succeeded without an ACK. Keep deduplication and
+          // An attempted send has an unknown outcome. Keep deduplication and
           // the delivery-safety gate intact; never retry this component here.
           result[component] = 'uncertain';
           logger.error?.(`[WA CALL] ${component} delivery unconfirmed`);
+          if (component === 'video') {
+            if (configured.text) result.text = 'held';
+            if (configured.audio) result.audio = 'held';
+            // A late video result must never resume the remaining components.
+            break;
+          }
         }
       }
       const outcomes = [result.text, result.audio, result.video];

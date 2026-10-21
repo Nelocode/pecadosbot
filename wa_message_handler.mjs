@@ -3,6 +3,7 @@ import {
   jidNormalizedUser,
   normalizeMessageContent,
 } from '@whiskeysockets/baileys';
+import { randomUUID } from 'node:crypto';
 import { settleWithTimeout } from './keyed_serial_queue.mjs';
 import { toWhatsAppAudioContent, toWhatsAppVideoContent } from './wa_audio_delivery.mjs';
 import { provisionalLanguageFromWhatsAppIdentity } from './whatsapp_language_hint.mjs';
@@ -171,6 +172,7 @@ export function createWhatsAppMessageHandler({
   }
 
   async function deliverResponse({ jid, decision, messageKey }) {
+    const deliveryContext = { trace_id: randomUUID(), response: decision.responseKey };
     const response = getResponseMessage(decision.language, decision.responseKey) || {};
     const result = {
       status: 'handled',
@@ -211,16 +213,22 @@ export function createWhatsAppMessageHandler({
       }
       try {
         await settleWithTimeout(
-          Promise.resolve(sendMessage(jid, content)),
+          Promise.resolve(sendMessage(jid, content, deliveryContext)),
           sendTimeoutMs,
           `El envío de ${component} de WhatsApp`,
         );
         result[component] = 'sent';
       } catch {
         // A timeout does not cancel Baileys. Keep the event claimed and never
-        // retry a component whose provider acknowledgement may have been lost.
+        // retry an attempted send whose outcome is unknown.
         result[component] = 'uncertain';
         logger.error?.(`[WA] ${component} delivery unconfirmed`);
+        if (component === 'video') {
+          if (configured.text) result.text = 'held';
+          if (configured.audio) result.audio = 'held';
+          // A late video result must never resume the remaining components.
+          break;
+        }
       }
     }
 
@@ -312,6 +320,7 @@ export function createWhatsAppMessageHandler({
             ? null
             : provisionalLanguageFromWhatsAppIdentity(contactAliases),
         });
+        if (decision?.persisted === false) throw new Error('interaction_state_not_persisted');
         return { jid, decision };
       });
     } catch {

@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 import hashlib
 
 from telethon.tl import functions
 
 from interaction_state import InteractionDecision, PersistentInteractionState
+from telegram_delivery_journal import TelegramVideoDeliveryUncertain
+
+
+telegram_queue_wait_ms = ContextVar("telegram_queue_wait_ms", default=0.0)
 
 
 def interaction_delivery_fingerprint(chat_id: int, event_id: str) -> str:
@@ -86,6 +91,9 @@ async def deliver_telegram_response_components(
             continue
         try:
             await sender()
+        except TelegramVideoDeliveryUncertain:
+            # A possible video delivery must settle before follow-up components.
+            raise
         except Exception as exc:
             # A failed component must not suppress the remaining configured media.
             # Re-raising after all attempts keeps the interaction uncommitted,
@@ -101,9 +109,12 @@ class TelegramInteractionDispatcher:
         self,
         state: PersistentInteractionState,
         send_response: Callable[[object, str, str, str], Awaitable[None]],
+        *,
+        on_committed: Callable[[str], None] | None = None,
     ) -> None:
         self.state = state
         self.send_response = send_response
+        self.on_committed = on_committed
         self._locks: dict[int, asyncio.Lock] = {}
 
     def _prune_idle_locks(self, active_chat_id: int) -> None:
@@ -130,6 +141,7 @@ class TelegramInteractionDispatcher:
         reply_peer: object | None = None,
     ) -> InteractionDecision:
         lock = self._locks.setdefault(chat_id, asyncio.Lock())
+        queued_at = asyncio.get_running_loop().time()
         try:
             async with lock:
                 decision = self.state.preview(
@@ -142,13 +154,19 @@ class TelegramInteractionDispatcher:
                 )
                 if not decision.duplicate and decision.response_key:
                     delivery_fingerprint = interaction_delivery_fingerprint(chat_id, event_id)
-                    await self.send_response(
-                        reply_peer if reply_peer is not None else chat_id,
-                        decision.response_key,
-                        decision.language,
-                        delivery_fingerprint,
+                    queue_token = telegram_queue_wait_ms.set(
+                        max(0.0, (asyncio.get_running_loop().time() - queued_at) * 1000)
                     )
-                    return self.state.register(
+                    try:
+                        await self.send_response(
+                            reply_peer if reply_peer is not None else chat_id,
+                            decision.response_key,
+                            decision.language,
+                            delivery_fingerprint,
+                        )
+                    finally:
+                        telegram_queue_wait_ms.reset(queue_token)
+                    registered = self.state.register(
                         contact_id=chat_id,
                         event_id=event_id,
                         kind=kind,
@@ -156,6 +174,13 @@ class TelegramInteractionDispatcher:
                         language_evidence=language_evidence,
                         provisional_language=provisional_language,
                     )
+                    if registered.persisted and self.on_committed is not None:
+                        try:
+                            self.on_committed(delivery_fingerprint)
+                        except TelegramVideoDeliveryUncertain:
+                            # Keep confirmed evidence if cleanup fails; delivery succeeded.
+                            pass
+                    return registered
                 return decision
         finally:
             self._prune_idle_locks(chat_id)

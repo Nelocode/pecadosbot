@@ -7,12 +7,14 @@ from telethon.tl import functions, types
 
 from interaction_state import PersistentInteractionState
 from language_detection import detect_language_evidence
+from telegram_delivery_journal import TelegramVideoDeliveryUncertain
 from telegram_dispatcher import (
     TelegramInteractionDispatcher,
     build_telegram_media_request,
     build_telegram_text_request,
     deliver_telegram_response_components,
     telegram_delivery_random_id,
+    telegram_queue_wait_ms,
 )
 
 
@@ -96,6 +98,24 @@ class TelegramInteractionDispatcherTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(video_error, caught.exception)
                 self.assertEqual(["video", "text", "audio"], order)
 
+    async def test_uncertain_video_holds_followups_for_steps_and_call(self):
+        for response_key in ("step1", "step2", "call"):
+            with self.subTest(response_key=response_key):
+                order = []
+
+                async def send_video():
+                    order.append("video")
+                    raise TelegramVideoDeliveryUncertain("uncertain")
+
+                with self.assertRaises(TelegramVideoDeliveryUncertain):
+                    await deliver_telegram_response_components(
+                        response_key,
+                        send_text=lambda: self._append_async(order, "text"),
+                        send_audio=lambda: self._append_async(order, "audio"),
+                        send_video=send_video,
+                    )
+                self.assertEqual(["video"], order)
+
     @staticmethod
     async def _append_async(target: list, value: str) -> None:
         target.append(value)
@@ -167,8 +187,10 @@ class TelegramInteractionDispatcherTests(unittest.IsolatedAsyncioTestCase):
             order = []
             first_started = asyncio.Event()
             release_first = asyncio.Event()
+            queue_times = []
 
             async def send_response(_chat_id, response_key, _language, _fingerprint):
+                queue_times.append(telegram_queue_wait_ms.get())
                 order.append(f"{response_key}:start")
                 if response_key == "step1":
                     first_started.set()
@@ -196,6 +218,9 @@ class TelegramInteractionDispatcherTests(unittest.IsolatedAsyncioTestCase):
                 ["step1:start", "step1:end", "step2:start", "step2:end"],
                 order,
             )
+            self.assertEqual(2, len(queue_times))
+            self.assertTrue(all(duration >= 0 for duration in queue_times))
+            self.assertEqual(0.0, telegram_queue_wait_ms.get())
 
     async def test_provisional_spanish_is_replaced_by_detected_customer_text(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -5,29 +5,37 @@ import logging
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
+import time
 import unittest
-from unittest.mock import AsyncMock, Mock
+import uuid
+from unittest.mock import AsyncMock, Mock, patch
 
 from telethon import errors
 from telethon.tl import functions, types
 
 from interaction_state import PersistentInteractionState
 from telegram_audio_branding import brand_audio_attributes, build_branded_audio_media
+from telegram_activity import telegram_typing_activity
+from telegram_delivery_journal import TelegramVideoDeliveryJournal, TelegramVideoDeliveryUncertain
 from telegram_dispatcher import (
     TelegramInteractionDispatcher, build_telegram_media_request,
     build_telegram_text_request, deliver_telegram_response_components,
+    interaction_delivery_fingerprint, telegram_queue_wait_ms,
 )
 
 
 def sender_functions():
     source = Path(__file__).resolve().parents[1] / "bot.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
-    names = {"send_response", "_retry_telegram_operation", "_upload_file_cached", "_evict_upload_cache"}
+    names = {"send_response", "_send_response_components", "_retry_telegram_operation", "_upload_file_cached", "_evict_upload_cache"}
     nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
     if {node.name for node in nodes} != names:
         raise AssertionError("Production sender functions were not found")
     namespace = {
         "asyncio": SimpleNamespace(**vars(asyncio)), "logging": logging, "Path": Path,
+        "time": time, "uuid": uuid, "telegram_queue_wait_ms": telegram_queue_wait_ms,
+        "TelegramVideoDeliveryUncertain": TelegramVideoDeliveryUncertain,
+        "telegram_typing_activity": telegram_typing_activity,
         "types": types, "errors": errors, "telegram_identity_verified": True,
         # Scaled budgets keep the real upload-vs-RPC scheduling test fast.
         "TELEGRAM_SEND_RETRIES": 3, "TELEGRAM_SEND_TIMEOUT_SECONDS": 0.015,
@@ -53,6 +61,8 @@ class FakeProvider:
     def __init__(self):
         self.requests = []
         self.uploads = []
+        self.upload_options = []
+        self.presences = []
         self.remote_messages = {}
         self.upload_action = None
         self.rpc_action = None
@@ -60,8 +70,9 @@ class FakeProvider:
     async def get_input_entity(self, peer):
         return types.InputPeerSelf()
 
-    async def upload_file(self, filename):
+    async def upload_file(self, filename, **kwargs):
         self.uploads.append(Path(filename).name)
+        self.upload_options.append(kwargs)
         if self.upload_action:
             await self.upload_action(filename)
         return types.InputFile(id=len(self.uploads), parts=1, name=Path(filename).name, md5_checksum="0" * 32)
@@ -72,6 +83,9 @@ class FakeProvider:
         return SimpleNamespace(id=request.random_id)
 
     async def __call__(self, request):
+        if isinstance(request, functions.messages.SetTypingRequest):
+            self.presences.append(request.action)
+            return True
         self.requests.append(request)
         if self.rpc_action:
             return await self.rpc_action(request)
@@ -90,6 +104,7 @@ class TelegramMediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.provider = FakeProvider()
         self.health = {}
         self.health_history = []
+        self.telemetry_history = []
         self.audio_path = root / "audios" / "fixture.mp3"
         self.video_path = root / "videos" / "fixture.mp4"
         self.cover_path = root / "cover.jpg"
@@ -99,6 +114,8 @@ class TelegramMediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         def update_interaction_health(**kwargs):
             self.health.update(kwargs)
+            if "telemetry" in kwargs:
+                self.telemetry_history.append(dict(kwargs["telemetry"]))
 
         def update_delivery_health(component, state):
             self.health["delivery"][component] = state
@@ -114,13 +131,26 @@ class TelegramMediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "update_delivery_health": update_delivery_health,
         })
         self.state = PersistentInteractionState(root / "interaction-state.json")
-        self.dispatcher = TelegramInteractionDispatcher(self.state, self.worker["send_response"])
+        self.journal = TelegramVideoDeliveryJournal(root / "video-delivery", "+570000000001")
+        self.worker["video_delivery_journal"] = self.journal
+        self.dispatcher = TelegramInteractionDispatcher(
+            self.state, self.worker["send_response"], on_committed=self.journal.completed,
+        )
 
     async def dispatch(self, event="fixture-event"):
         return await self.dispatcher.dispatch(chat_id=1, event_id=event, kind="content")
 
     def preview(self, event="fixture-event"):
         return self.state.preview(contact_id=1, event_id=event, kind="content")
+
+    def restart_fixture(self):
+        self.state = PersistentInteractionState(self.state.file_path)
+        self.journal = TelegramVideoDeliveryJournal(Path(self.temp.name) / "video-delivery", "+570000000001")
+        self.worker["video_delivery_journal"] = self.journal
+        self.worker["_uploaded_media_cache"].clear()
+        self.dispatcher = TelegramInteractionDispatcher(
+            self.state, self.worker["send_response"], on_committed=self.journal.completed,
+        )
 
     def configure_audio(self, *, cover=False):
         self.audio_path.write_bytes(b"synthetic audio, never sent")
@@ -140,6 +170,7 @@ class TelegramMediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, decision.phase)
         self.assertTrue(duplicate.duplicate)
         self.assertEqual(["fixture.mp4"], self.provider.uploads)
+        self.assertEqual([{"part_size_kb": 512}], self.provider.upload_options)
         self.assertEqual(1, len(self.provider.requests))
         self.assertEqual("sent", self.health["delivery"]["video"])
         self.assertIn(("video", "uploading"), self.health_history)
@@ -158,7 +189,7 @@ class TelegramMediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("failed", self.health["delivery"]["video"])
         self.assertEqual("step1", self.preview().response_key)
 
-    async def test_lost_ack_reuses_handle_and_random_id_despite_cache_eviction(self):
+    async def test_lost_ack_never_retries_even_after_cache_eviction_and_restart(self):
         async def lose_first_ack(request):
             result = self.provider.acknowledge(request)
             if len(self.provider.requests) == 1:
@@ -167,15 +198,17 @@ class TelegramMediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
             return result
 
         self.provider.rpc_action = lose_first_ack
-        await self.dispatch()
-        self.assertEqual(2, len(self.provider.requests))
-        first, second = self.provider.requests
-        self.assertEqual(first.random_id, second.random_id)
-        self.assertIs(first.media.file, second.media.file)
+        with self.assertRaises(TelegramVideoDeliveryUncertain):
+            await self.dispatch()
+        self.restart_fixture()
+        with self.assertRaises(TelegramVideoDeliveryUncertain):
+            await self.dispatch()
+        self.assertEqual(1, len(self.provider.requests))
         self.assertEqual(["fixture.mp4"], self.provider.uploads)
         self.assertEqual(1, len(self.provider.remote_messages))
         self.assertIn(("video", "uncertain"), self.health_history)
-        self.assertEqual("sent", self.health["delivery"]["video"])
+        self.assertEqual("uncertain", self.health["delivery"]["video"])
+        self.assertFalse(self.preview().duplicate)
 
     async def test_unacknowledged_delivery_stays_uncertain_and_does_not_advance(self):
         async def lose_every_ack(request):
@@ -183,16 +216,16 @@ class TelegramMediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.Event().wait()
 
         self.provider.rpc_action = lose_every_ack
-        with self.assertRaisesRegex(RuntimeError, "telegram_video_delivery_failed"):
+        with self.assertRaises(TelegramVideoDeliveryUncertain):
             await self.dispatch()
-        self.assertEqual(3, len(self.provider.requests))
+        self.assertEqual(1, len(self.provider.requests))
         self.assertEqual(1, len({request.random_id for request in self.provider.requests}))
         self.assertEqual(1, len(self.provider.remote_messages))
         self.assertEqual(["fixture.mp4"], self.provider.uploads)
         self.assertEqual("uncertain", self.health["delivery"]["video"])
         self.assertEqual("step1", self.preview().response_key)
 
-    async def test_video_lost_ack_still_delivers_text_audio_and_retry_commits_without_duplicates(self):
+    async def test_video_lost_ack_holds_text_audio_across_restart_and_configuration_change(self):
         self.audio_path.write_bytes(b"synthetic audio, never sent")
         self.worker["get_response_components"] = lambda *_: (
             "fixture text", self.audio_path.name, self.video_path.name,
@@ -210,55 +243,159 @@ class TelegramMediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
             return result
 
         self.provider.rpc_action = lose_video_ack
-        with self.assertRaisesRegex(RuntimeError, "telegram_video_delivery_failed"):
+        with self.assertRaises(TelegramVideoDeliveryUncertain):
             await self.dispatch()
         self.assertEqual(
-            ["video", "video", "video", "text", "audio"],
+            ["video"],
             [component(request) for request in self.provider.requests],
         )
         self.assertEqual(
-            {"video": "uncertain", "text": "sent", "audio": "sent"},
+            {"video": "uncertain", "text": "held", "audio": "held"},
             {key: self.health["delivery"][key] for key in ("video", "text", "audio")},
         )
         self.assertFalse(self.preview().duplicate)
         self.assertEqual("step1", self.preview().response_key)
-        self.assertEqual(3, len(self.provider.remote_messages))
-        first_ids = {component(request): request.random_id for request in self.provider.requests}
-        self.assertEqual(3, len(set(first_ids.values())))
-
+        self.assertEqual(1, len(self.provider.remote_messages))
+        self.restart_fixture()
+        self.worker["get_response_components"] = lambda *_: ("changed text", self.audio_path.name, "")
         self.provider.rpc_action = None
-        decision = await self.dispatch()
-        self.assertEqual(1, decision.phase)
-        self.assertTrue(self.preview().duplicate)
-        self.assertEqual(
-            ["video", "text", "audio"],
-            [component(request) for request in self.provider.requests[-3:]],
-        )
-        self.assertEqual(
-            first_ids,
-            {component(request): request.random_id for request in self.provider.requests[-3:]},
-        )
-        self.assertEqual(3, len(self.provider.remote_messages))
-        self.assertEqual(["fixture.mp4", "fixture.mp3"], self.provider.uploads)
-        request_count = len(self.provider.requests)
-        self.assertTrue((await self.dispatch()).duplicate)
-        self.assertEqual(request_count, len(self.provider.requests))
-
-    async def test_uncertainty_survives_later_rejection_or_prepare_failure(self):
-        async def ambiguous_then_rejected(request):
-            if len(self.provider.requests) == 1:
-                self.provider.acknowledge(request)
-                await asyncio.Event().wait()
-            self.video_path.unlink()
-            raise errors.BadRequestError(request, "FILE_PART_INVALID")
-
-        self.provider.rpc_action = ambiguous_then_rejected
-        with self.assertRaisesRegex(RuntimeError, "telegram_video_upload_failed"):
+        with self.assertRaises(TelegramVideoDeliveryUncertain):
             await self.dispatch()
-        self.assertEqual("uncertain", self.health["delivery"]["video"])
-        self.assertEqual("step1", self.preview().response_key)
-        uncertainty = self.health_history.index(("video", "uncertain"))
-        self.assertTrue(all(state == "uncertain" for component, state in self.health_history[uncertainty:] if component == "video"))
+        self.assertEqual(1, len(self.provider.requests))
+        self.assertEqual(["fixture.mp4"], self.provider.uploads)
+        self.assertEqual("held", self.health["delivery"]["text"])
+        self.assertFalse(self.preview().duplicate)
+
+    async def test_video_sdk_errors_stop_after_first_ambiguous_result(self):
+        for error_type in (errors.TimeoutError, errors.ServerError, ValueError, OSError):
+            with self.subTest(error=error_type.__name__):
+                self.prepare_fixture()
+
+                async def fail(request):
+                    if error_type is errors.ServerError:
+                        raise error_type(request, "INTERNAL")
+                    if error_type is errors.TimeoutError:
+                        raise error_type(request)
+                    raise error_type("synthetic ambiguous failure")
+
+                self.provider.rpc_action = fail
+                with self.assertRaises(TelegramVideoDeliveryUncertain):
+                    await self.dispatch()
+                self.assertEqual(1, len(self.provider.requests))
+                self.assertEqual("uncertain", self.health["delivery"]["video"])
+
+    async def test_definite_video_rejection_preserves_text_fallback_and_stable_ids(self):
+        self.worker["get_response_components"] = lambda *_: ("fixture text", "", self.video_path.name)
+
+        async def reject_video(request):
+            if isinstance(request, functions.messages.SendMediaRequest):
+                raise errors.BadRequestError(request, "FILE_PART_INVALID")
+            return self.provider.acknowledge(request)
+
+        self.provider.rpc_action = reject_video
+        with self.assertRaisesRegex(RuntimeError, "telegram_video_delivery_failed"):
+            await self.dispatch()
+        self.assertEqual("failed", self.health["delivery"]["video"])
+        self.assertEqual("sent", self.health["delivery"]["text"])
+        video_ids = {request.random_id for request in self.provider.requests[:-1]}
+        self.assertEqual(1, len(video_ids))
+        self.assertFalse(self.preview().duplicate)
+        self.provider.rpc_action = None
+        await self.dispatch()
+        self.assertEqual(video_ids, {self.provider.requests[-2].random_id})
+        self.assertEqual(2, len(self.provider.remote_messages))
+        self.assertTrue(self.preview().duplicate)
+
+    async def test_failed_ack_persistence_holds_followups_and_cannot_resend(self):
+        self.worker["get_response_components"] = lambda *_: ("fixture text", "", self.video_path.name)
+        with patch.object(self.journal, "confirmed", side_effect=TelegramVideoDeliveryUncertain("storage")):
+            with self.assertRaises(TelegramVideoDeliveryUncertain):
+                await self.dispatch()
+        self.restart_fixture()
+        with self.assertRaises(TelegramVideoDeliveryUncertain):
+            await self.dispatch()
+        self.assertEqual(1, len(self.provider.requests))
+        self.assertEqual(1, len(self.provider.remote_messages))
+        self.assertEqual("held", self.health["delivery"]["text"])
+
+    async def test_failed_claim_never_calls_send_media(self):
+        with patch.object(self.journal, "claim", side_effect=TelegramVideoDeliveryUncertain("storage")):
+            with self.assertRaises(TelegramVideoDeliveryUncertain):
+                await self.dispatch()
+        self.assertFalse(self.provider.requests)
+
+    async def test_sent_record_is_released_only_after_interaction_persists(self):
+        fingerprint = interaction_delivery_fingerprint(1, "fixture-event")
+        with patch.object(self.state, "_save", return_value=False):
+            decision = await self.dispatch()
+        self.assertFalse(decision.persisted)
+        self.assertTrue(self.journal.check(fingerprint))
+        self.restart_fixture()
+        decision = await self.dispatch()
+        self.assertTrue(decision.persisted)
+        self.assertFalse(self.journal.check(fingerprint))
+        self.assertEqual(1, len(self.provider.requests))
+        self.assertEqual(["fixture.mp4"], self.provider.uploads)
+        self.restart_fixture()
+        self.assertTrue((await self.dispatch()).duplicate)
+        self.assertEqual(1, len(self.provider.requests))
+
+    async def test_typing_runs_during_upload_without_advancing_text(self):
+        self.worker["get_response_components"] = lambda *_: ("fixture text", "", self.video_path.name)
+        upload_started = asyncio.Event()
+        finish_upload = asyncio.Event()
+
+        async def upload(_filename):
+            upload_started.set()
+            await finish_upload.wait()
+
+        self.provider.upload_action = upload
+        task = asyncio.create_task(self.dispatch())
+        await upload_started.wait()
+        self.assertTrue(any(isinstance(action, types.SendMessageTypingAction) for action in self.provider.presences))
+        self.assertFalse(self.provider.requests)
+        self.assertFalse(self.telemetry_history)
+        finish_upload.set()
+        await task
+        self.assertIsInstance(self.provider.requests[0], functions.messages.SendMediaRequest)
+        self.assertIsInstance(self.provider.requests[1], functions.messages.SendMessageRequest)
+        self.assertIsInstance(self.provider.presences[-1], types.SendMessageCancelAction)
+
+    async def test_concurrent_operations_publish_separate_final_timing_snapshots(self):
+        first_started = asyncio.Event()
+        finish_first = asyncio.Event()
+
+        async def upload(_filename):
+            first_started.set()
+            await finish_first.wait()
+
+        self.provider.upload_action = upload
+        first = asyncio.create_task(self.dispatch("timing-first"))
+        await first_started.wait()
+        self.assertFalse(self.telemetry_history)
+        # A different chat is not queued behind the first operation.
+        self.provider.upload_action = None
+        await self.dispatcher.dispatch(chat_id=2, event_id="timing-second", kind="content")
+        second_snapshot = dict(self.telemetry_history[0])
+        finish_first.set()
+        await first
+        self.assertEqual(2, len(self.telemetry_history))
+        self.assertEqual(second_snapshot, self.telemetry_history[0])
+        self.assertNotEqual(second_snapshot["trace_id"], self.telemetry_history[1]["trace_id"])
+        for snapshot in self.telemetry_history:
+            self.assertEqual(4, uuid.UUID(snapshot["trace_id"]).version)
+            self.assertEqual("sent", snapshot["outcome"])
+            self.assertEqual("step1", snapshot["response"])
+            self.assertEqual(self.video_path.stat().st_size, snapshot["video_bytes"])
+            self.assertFalse(snapshot["video_cache_hit"])
+            self.assertGreater(snapshot["observed_at"], 0)
+            for phase in ("queue_ms", "prepare_ms", "upload_ms", "rpc_ms", "total_ms"):
+                self.assertGreaterEqual(snapshot[phase], 0)
+            self.assertGreaterEqual(snapshot["total_ms"], snapshot["upload_ms"])
+            self.assertEqual({
+                "trace_id", "observed_at", "response", "outcome", "queue_ms",
+                "prepare_ms", "upload_ms", "rpc_ms", "total_ms", "video_bytes", "video_cache_hit",
+            }, set(snapshot))
 
     async def test_sdk_timeouts_and_exhausted_retry_errors_keep_cover_and_handle(self):
         for error_type in (errors.TimeoutError, errors.ServerError, ValueError):
@@ -362,6 +499,11 @@ class TelegramMediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual("step1", self.preview().response_key)
                 self.assertEqual("failed" if phase == "upload" else "uncertain", self.health["delivery"]["video"])
                 self.assertEqual(0 if phase == "upload" else 1, len(self.provider.requests))
+                if phase == "rpc":
+                    self.restart_fixture()
+                    with self.assertRaises(TelegramVideoDeliveryUncertain):
+                        await self.dispatch()
+                    self.assertEqual(1, len(self.provider.requests))
 
     async def test_missing_named_audio_does_not_suppress_video_or_confirm_partial_delivery(self):
         self.worker["get_response_components"] = lambda *_: ("fixture text", self.audio_path.name, self.video_path.name)
@@ -374,8 +516,9 @@ class TelegramMediaDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, len(first_ids))
 
         self.audio_path.write_bytes(b"synthetic replacement, never sent")
+        self.restart_fixture()
         await self.dispatch()
         self.assertTrue(self.preview().duplicate)
         self.assertEqual(3, len(self.provider.remote_messages))
-        self.assertEqual(first_ids[0], self.provider.requests[2].random_id)
-        self.assertEqual(first_ids[1], self.provider.requests[3].random_id)
+        self.assertEqual(first_ids[1], self.provider.requests[2].random_id)
+        self.assertEqual(1, sum(request.random_id == first_ids[0] for request in self.provider.requests))
