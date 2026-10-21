@@ -3,6 +3,7 @@ import json
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 
 from telegram_auth import TelegramAuthManager, _error_outcome, describe_sent_code
 
@@ -85,6 +86,8 @@ class FakeClient:
         self.sign_in_count = 0
         self.loop_ids = []
         self.sign_in_arguments = []
+        self.user = SimpleNamespace(id=123, phone="570000000000", bot=False)
+        self.get_me_error = None
 
     def _record_loop(self):
         self.loop_ids.append(id(asyncio.get_running_loop()))
@@ -101,6 +104,12 @@ class FakeClient:
     async def is_user_authorized(self):
         self._record_loop()
         return self.authorized
+
+    async def get_me(self):
+        self._record_loop()
+        if self.get_me_error:
+            raise self.get_me_error
+        return self.user
 
     async def send_code_request(self, phone):
         self._record_loop()
@@ -202,6 +211,68 @@ class TelegramAuthTestCase(unittest.TestCase):
         manager.verify_code(self.CODE, begun.attempt_token)
         self.assertFalse(manager.has_pending())
 
+    def test_existing_session_requires_matching_user_identity(self):
+        for user in (
+            SimpleNamespace(phone="571111111111", bot=False),
+            SimpleNamespace(phone=None, bot=False),
+            SimpleNamespace(phone="570000000000", bot=True),
+            None,
+        ):
+            with self.subTest(user=user):
+                client = FakeClient()
+                client.authorized = True
+                client.user = user
+                manager = self.make_manager(client)
+                result = manager.begin(self.API_ID, self.API_HASH, self.PHONE)
+                self.assertFalse(result.public["ok"])
+                self.assertEqual("account_mismatch", result.public["error_code"])
+                self.assertIsNone(result.credentials)
+                self.assertFalse(client.connected)
+                self.assertTrue(client.authorized)  # No logout of the other account.
+                self.assertEqual(0, client.send_count)
+                self.assert_public_does_not_contain(result.public, self.PHONE, self.API_HASH, "571111111111")
+
+    def test_existing_matching_session_can_be_reused(self):
+        client = FakeClient()
+        client.authorized = True
+        manager = self.make_manager(client)
+        result = manager.begin(self.API_ID, self.API_HASH, self.PHONE)
+        self.assertTrue(result.public["already_authorized"])
+        self.assertEqual((self.API_ID, self.API_HASH, self.PHONE), result.credentials)
+        self.assertFalse(client.connected)
+
+    def test_code_and_password_require_matching_identity_after_authorization(self):
+        for needs_password in (False, True):
+            for phone, bot in (("571111111111", False), (None, False), ("570000000000", True)):
+                with self.subTest(needs_password=needs_password, phone=phone, bot=bot):
+                    client = FakeClient(require_password=needs_password)
+                    client.user = SimpleNamespace(phone=phone, bot=bot)
+                    manager = self.make_manager(client)
+                    begun = manager.begin(self.API_ID, self.API_HASH, self.PHONE)
+                    result = manager.verify_code(self.CODE, begun.attempt_token)
+                    if needs_password:
+                        self.assertTrue(result.public["needs_password"])
+                        result = manager.verify_password(self.PASSWORD, begun.attempt_token)
+                    self.assertEqual("account_mismatch", result.public["error_code"])
+                    self.assertIsNone(result.credentials)
+                    self.assertFalse(manager.has_pending())
+                    self.assertFalse(client.connected)
+                    self.assertTrue(client.authorized)
+
+    def test_get_me_failure_never_returns_verified_credentials(self):
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                client = FakeClient()
+                client.authorized = existing
+                client.get_me_error = SecretServerError("private account detail")
+                manager = self.make_manager(client)
+                result = manager.begin(self.API_ID, self.API_HASH, self.PHONE)
+                if not existing:
+                    result = manager.verify_code(self.CODE, result.attempt_token)
+                self.assertFalse(result.public["ok"])
+                self.assertIsNone(result.credentials)
+                self.assertFalse(client.connected)
+                self.assert_public_does_not_contain(result.public, "private account detail", self.PHONE)
     def test_expiry_callback_disconnects_an_abandoned_challenge(self):
         client = FakeClient()
         manager = self.make_manager(client)

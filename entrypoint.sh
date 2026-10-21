@@ -8,6 +8,9 @@ echo "╚═══════════════════════�
 
 cd /app
 
+# Validate ownership before copying defaults or loading any persisted settings.
+python -c 'from instance_paths import resolve_instance_data_directory; resolve_instance_data_directory("/app")' || exit 1
+
 # ── 0. Instalar dependencias faltantes si es necesario ───────────────
 if [ ! -d /app/node_modules/@whiskeysockets/baileys ]; then
     npm ci --omit=dev --ignore-scripts
@@ -60,7 +63,7 @@ if [ -n "$TG_API_ID" ] && [ -n "$TG_API_HASH" ] \
    && [ -f /app/data/tg_session.session ] \
    && [ -f /app/data/tg_session_authorized.json ]; then
     echo "📱 Iniciando Bot Telegram (User Bot)..."
-    nohup env -u PANEL_ADMIN_RECOVERY_KEY python bot.py > /tmp/bot_tg.log 2>&1 &
+    nohup env -u PANEL_ADMIN_RECOVERY_KEY python bot.py > /app/data/bot_tg.log 2>&1 &
     echo $! > /app/data/tg_userbot.pid
     echo "  → PID: $!"
 elif [ -n "$TG_API_ID" ] && [ -n "$TG_API_HASH" ]; then
@@ -72,7 +75,7 @@ fi
 # ── 3. Bot Telegram (BotFather - Bot API) ───────────────────────────
 if [ -n "$AUTOREPLY_BOT_TOKEN" ]; then
     echo "🤖 Iniciando BotFather Bot..."
-    nohup env -u PANEL_ADMIN_RECOVERY_KEY python botfather_bot.py > /tmp/bot_bf.log 2>&1 &
+    nohup env -u PANEL_ADMIN_RECOVERY_KEY python botfather_bot.py > /app/data/bot_bf.log 2>&1 &
     echo $! > /app/data/botfather.pid
     echo "  → PID: $!"
 else
@@ -82,7 +85,7 @@ fi
 # ── 4. Bot WhatsApp ──────────────────────────────────────────────────
 if [ -d "/app/data/wa_auth" ] && [ "$(ls -A /app/data/wa_auth 2>/dev/null)" ]; then
     echo "💬 Iniciando Bot WhatsApp..."
-    nohup env -u PANEL_ADMIN_RECOVERY_KEY node wa_bot.mjs > /tmp/bot_wa.log 2>&1 &
+    nohup env -u PANEL_ADMIN_RECOVERY_KEY node wa_bot.mjs > /app/data/bot_wa.log 2>&1 &
     echo $! > /app/data/wa_bot.pid
     echo "  → PID: $!"
 else

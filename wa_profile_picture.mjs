@@ -7,6 +7,7 @@ const DEFAULT_RETRY_MS = 60 * 60 * 1000;
 const RATE_LIMIT_RETRY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_ACCOUNTS = 12;
+const REQUEST_TTL_MS = 10 * 60 * 1000;
 const inFlight = new Set();
 
 function sha256(value) {
@@ -20,6 +21,27 @@ export function whatsappProfileAccountHash(jid) {
   const account = local.split(':', 1)[0];
   if (!account || !server) return null;
   return sha256(`${account}@${server}`);
+}
+
+function readRequest(requestPath, accountHash, timestamp) {
+  if (!requestPath) return { status: 'not_requested' };
+  let request;
+  try { request = JSON.parse(fs.readFileSync(requestPath, 'utf8')); } catch (error) {
+    return { status: error?.code === 'ENOENT' ? 'not_requested' : 'failed', errorCode: 'request_unavailable' };
+  }
+  if (request?.brand !== 'pecadosvip' || request.status !== 'pending'
+    || !/^[a-f0-9]{32}$/.test(request.requestId || '')
+    || !/^[a-f0-9]{64}$/.test(request.accountHash || '')
+    || !/^[a-f0-9]{64}$/.test(request.imageHash || '')
+    || !Number.isFinite(request.requestedAt) || !Number.isFinite(request.expiresAt)
+    || request.expiresAt - request.requestedAt !== REQUEST_TTL_MS) {
+    return { status: 'failed', errorCode: 'request_invalid' };
+  }
+  if (request.accountHash !== accountHash) return { status: 'not_requested' };
+  if (timestamp < request.requestedAt || timestamp > request.expiresAt) {
+    return { status: 'failed', errorCode: 'request_expired' };
+  }
+  return { request };
 }
 
 function readState(statePath) {
@@ -108,6 +130,7 @@ export async function applyWhatsAppProfilePicture({
   updateProfilePicture,
   imagePath,
   statePath,
+  requestPath,
   expectedImageHash,
   logger = console,
   now = Date.now,
@@ -121,6 +144,9 @@ export async function applyWhatsAppProfilePicture({
 
   try {
     const timestamp = Number(now());
+    const requested = readRequest(requestPath, accountHash, timestamp);
+    if (!requested.request) return requested;
+    const request = requested.request;
     const previous = readState(statePath).accounts[accountHash];
     // A previous process may have stopped after sending its request. An image
     // change cannot make that outstanding operation safe to retry automatically.
@@ -141,7 +167,7 @@ export async function applyWhatsAppProfilePicture({
     let image;
     try { image = fs.readFileSync(imagePath); } catch { /* Recorded below without local paths. */ }
     const imageHash = image ? sha256(image) : null;
-    const record = { imageHash, attemptedAt: timestamp };
+    const record = { imageHash, attemptedAt: timestamp, requestId: request.requestId, brand: 'pecadosvip' };
     if (expectedImageHash !== undefined) record.expectedImageHash = expectedImageHash;
     const save = result => {
       writeAccount(statePath, accountHash, { ...record, ...result }, timestamp);
@@ -150,12 +176,16 @@ export async function applyWhatsAppProfilePicture({
         : { status: result.status, verification: result.verification };
     };
 
-    if (expectedImageHash !== undefined && !/^[a-f0-9]{64}$/.test(expectedImageHash || '')) {
+    if (!/^[a-f0-9]{64}$/.test(expectedImageHash || '')) {
       return save({ status: 'missing', errorCode: 'official_image_missing' });
     }
     if (!image) return save({ status: 'missing', errorCode: 'image_missing' });
-    if (expectedImageHash !== undefined && imageHash !== expectedImageHash) {
+    if (imageHash !== expectedImageHash) {
       return save({ status: 'failed', errorCode: 'unexpected_image' });
+    }
+    if (imageHash !== request.imageHash) return save({ status: 'failed', errorCode: 'request_image_changed' });
+    if (previous?.requestId === request.requestId && previous.status === 'failed') {
+      return { status: 'failed', errorCode: previous.errorCode || 'rejected' };
     }
     if (previous?.status === 'applied' && previous.imageHash === imageHash) {
       if (!previous.verification) {
@@ -169,7 +199,13 @@ export async function applyWhatsAppProfilePicture({
     writeAccount(statePath, accountHash, { ...record, status: 'pending' }, timestamp);
     const boundedTimeout = Math.min(60_000, Math.max(1, Number(timeoutMs) || DEFAULT_TIMEOUT_MS));
     const result = await boundedUpdate(
-      () => updateProfilePicture(jid, image, { width: 640, height: 640 }),
+      () => {
+        const current = readRequest(requestPath, accountHash, Number(now())).request;
+        if (current?.requestId !== request.requestId) {
+          throw Object.assign(new Error('request superseded'), { data: 409 });
+        }
+        return updateProfilePicture(jid, image, { width: 640, height: 640 });
+      },
       boundedTimeout,
     );
     const { retryDelay, ...outcome } = result;
@@ -190,4 +226,23 @@ export async function applyWhatsAppProfilePicture({
   } finally {
     inFlight.delete(key);
   }
+}
+
+export function pollWhatsAppProfilePicture({ getOptions, isActive, intervalMs = 5_000, durationMs = REQUEST_TTL_MS }) {
+  let stopped = false;
+  let timer;
+  const deadline = Date.now() + durationMs;
+  const stop = () => {
+    stopped = true;
+    clearTimeout(timer);
+  };
+  const tick = async () => {
+    if (stopped || !isActive() || Date.now() > deadline) { stop(); return; }
+    try { await applyWhatsAppProfilePicture(getOptions()); } catch { /* Status remains unconfirmed. */ }
+    if (stopped || !isActive() || Date.now() > deadline) { stop(); return; }
+    timer = setTimeout(tick, intervalMs);
+    timer.unref?.();
+  };
+  void tick();
+  return { stop };
 }

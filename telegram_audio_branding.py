@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -20,9 +21,14 @@ else:
     hachoir_config.quiet = True
 
 
-AUDIO_TITLE = "Las Fiesteras"
-AUDIO_PERFORMER = "Caché Madrid"
+AUDIO_TITLE = "PecadosVIP"
+AUDIO_PERFORMER = "PecadosVIP"
 AUDIO_BRANDING_MAX_LENGTH = 80
+_LEGACY_BRAND_LABELS = frozenset({"las fiesteras", "caché madrid"})
+_LEGACY_COVER_SHA256 = frozenset({
+    "e6f37056f908ff6289972ef349fb07373e9676e2bae187835af563ffecc7427f",
+    "8df2135ee1fba375ec455c44ed4db0320351c120818c8dda0b46e18a4391a364",
+})
 
 
 def _environment_text(
@@ -49,6 +55,18 @@ def _branding_text(value: object) -> str | None:
     return normalized
 
 
+def _legacy_brand_label(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+    return normalized in _LEGACY_BRAND_LABELS
+
+
+def _instance_branding_text(value: object) -> str | None:
+    """Ignore only the inherited brand; preserve unrelated custom labels."""
+    return None if _legacy_brand_label(value) else _branding_text(value)
+
+
 def _read_branding_file(path: str | Path | None) -> dict[str, str]:
     if path is None:
         return {}
@@ -61,7 +79,7 @@ def _read_branding_file(path: str | Path | None) -> dict[str, str]:
     return {
         field: normalized
         for field in ("title", "performer")
-        if (normalized := _branding_text(parsed.get(field))) is not None
+        if (normalized := _instance_branding_text(parsed.get(field))) is not None
     }
 
 
@@ -76,10 +94,10 @@ def resolve_audio_branding(
     source = os.environ if environ is None else environ
     resolved = {"title": AUDIO_TITLE, "performer": AUDIO_PERFORMER}
     resolved.update(_read_branding_file(defaults_path))
-    environment_title = _branding_text(source.get("TG_AUDIO_TITLE"))
+    environment_title = _instance_branding_text(source.get("TG_AUDIO_TITLE"))
     if environment_title is not None:
         resolved["title"] = environment_title
-    environment_performer = _branding_text(source.get("TG_AUDIO_PERFORMER"))
+    environment_performer = _instance_branding_text(source.get("TG_AUDIO_PERFORMER"))
     if environment_performer is not None:
         resolved["performer"] = environment_performer
     resolved.update(_read_branding_file(settings_path))
@@ -94,6 +112,8 @@ def save_audio_branding_settings(
 ) -> dict[str, str]:
     """Validate and atomically persist both labels edited in the panel."""
 
+    if _legacy_brand_label(title) or _legacy_brand_label(performer):
+        raise ValueError("La marca heredada no corresponde a PecadosVIP; usa sus textos o una personalización propia.")
     normalized_title = _branding_text(title)
     if normalized_title is None:
         raise ValueError(
@@ -133,14 +153,20 @@ def resolve_audio_cover_path(
 
     source = os.environ if environ is None else environ
     application_root = Path(base_dir)
+    official_cover = application_root / "assets" / "audio-cover.jpg"
     configured = _environment_text(source, "TG_AUDIO_COVER_PATH", "")
     if not configured:
-        return application_root / "assets" / "audio-cover.jpg"
+        return official_cover
 
     candidate = Path(configured).expanduser()
-    if candidate.is_absolute():
-        return candidate
-    return application_root / candidate
+    if not candidate.is_absolute():
+        candidate = application_root / candidate
+    try:
+        if hashlib.sha256(candidate.read_bytes()).hexdigest() in _LEGACY_COVER_SHA256:
+            return official_cover
+    except OSError:
+        pass  # Preserve the worker's existing handling of an unavailable override.
+    return candidate
 
 
 def brand_audio_attributes(

@@ -84,7 +84,9 @@ class AdminTemplateTestCase(unittest.TestCase):
         template = app_module.TEMPLATE
         self.assertIn('id="tg-audio-performer"', template)
         self.assertIn('id="tg-audio-title"', template)
-        self.assertIn('placeholder="Caché Madrid"', template)
+        self.assertIn('placeholder="PecadosVIP"', template)
+        self.assertNotIn('placeholder="Caché Madrid"', template)
+        self.assertNotIn('branding.title || "Las Fiesteras"', template)
         self.assertIn('fetch("/api/telegram_audio_branding"', template)
         self.assertIn("JSON.stringify({title, performer})", template)
         self.assertIn("let tgAudioBrandingDirty = false", template)
@@ -391,7 +393,7 @@ class AdminTemplateTestCase(unittest.TestCase):
             patch.object(app_module.sys, "platform", "darwin"),
             patch.object(app_module.subprocess, "run", return_value=fake_ps) as run_mock,
         ):
-            self.assertTrue(app_module._is_telegram_worker_pid(4321))
+            self.assertEqual("/usr/bin/python3 /app/bot.py", app_module._posix_process_command_line(4321))
             run_mock.assert_called_once()
 
     def test_modular_language_can_be_added_detected_and_deleted_from_panel(self):

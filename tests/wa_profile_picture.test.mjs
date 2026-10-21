@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { applyWhatsAppProfilePicture, whatsappProfileAccountHash } from '../wa_profile_picture.mjs';
+import { applyWhatsAppProfilePicture, pollWhatsAppProfilePicture, whatsappProfileAccountHash } from '../wa_profile_picture.mjs';
 
 const JID = '573001234567:4@s.whatsapp.net';
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
@@ -14,6 +14,7 @@ function fixture(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-profile-picture-'));
   const imagePath = path.join(directory, 'logo.jpg');
   const statePath = path.join(directory, 'state.json');
+  const requestPath = path.join(directory, 'wa_profile_picture_request.json');
   const image = Buffer.from('test-logo');
   fs.writeFileSync(imagePath, image);
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -21,13 +22,24 @@ function fixture(t) {
     jid: JID,
     imagePath,
     statePath,
+    requestPath,
     expectedImageHash: hash(image),
     updateProfilePicture: async () => {},
     logger: {},
     now: () => 1_000,
   };
+  const queue = (jid = JID, imageHash = options.expectedImageHash, requestedAt = 1_000, extra = {}) => {
+    const request = {
+      brand: 'pecadosvip', status: 'pending', requestId: crypto.randomUUID().replaceAll('-', ''),
+      accountHash: whatsappProfileAccountHash(jid), imageHash,
+      requestedAt, expiresAt: requestedAt + 600_000, ...extra,
+    };
+    fs.writeFileSync(requestPath, JSON.stringify(request));
+    return request;
+  };
+  queue();
   const read = (jid = JID) => JSON.parse(fs.readFileSync(statePath, 'utf8')).accounts[whatsappProfileAccountHash(jid)];
-  return { directory, imagePath, statePath, image, options, read };
+  return { directory, imagePath, statePath, requestPath, image, options, read, queue };
 }
 
 function deferred() {
@@ -35,6 +47,85 @@ function deferred() {
   const promise = new Promise(done => { resolve = done; });
   return { promise, resolve };
 }
+
+test('ordinary startup and reconnect without a panel request never change a profile', async t => {
+  const files = fixture(t);
+  fs.rmSync(files.requestPath);
+  let calls = 0;
+  const options = { ...files.options, updateProfilePicture: async () => { calls += 1; } };
+  for (let restart = 0; restart < 3; restart += 1) {
+    assert.equal((await applyWhatsAppProfilePicture(options)).status, 'not_requested');
+  }
+  assert.equal(calls, 0);
+  assert.equal(fs.existsSync(files.statePath), false);
+});
+
+test('a request authorizes only its exact account, PecadosVIP brand, image and lifetime', async t => {
+  const files = fixture(t);
+  let calls = 0;
+  const options = { ...files.options, updateProfilePicture: async () => { calls += 1; } };
+  files.queue('573000000000@s.whatsapp.net');
+  assert.equal((await applyWhatsAppProfilePicture(options)).status, 'not_requested');
+  files.queue(JID, options.expectedImageHash, 1_000, { brand: 'las-fiesteras' });
+  assert.equal((await applyWhatsAppProfilePicture(options)).errorCode, 'request_invalid');
+  files.queue(JID, options.expectedImageHash, -600_000);
+  assert.equal((await applyWhatsAppProfilePicture(options)).errorCode, 'request_expired');
+  files.queue(JID, hash('other-logo'));
+  assert.equal((await applyWhatsAppProfilePicture(options)).errorCode, 'request_image_changed');
+  assert.equal(calls, 0);
+});
+
+test('a definite rejected request does not retry itself after its cooldown', async t => {
+  const files = fixture(t);
+  let calls = 0;
+  const options = { ...files.options, updateProfilePicture: async () => {
+    calls += 1;
+    throw Object.assign(new Error('rejected'), { data: 403 });
+  } };
+  await applyWhatsAppProfilePicture(options);
+  assert.equal((await applyWhatsAppProfilePicture({ ...options, now: () => 3_602_000 })).errorCode, 'request_expired');
+  assert.equal(calls, 1);
+});
+
+test('poller picks up a post-link request and stops on disconnect', async t => {
+  const files = fixture(t);
+  fs.rmSync(files.requestPath);
+  let active = true;
+  let reads = 0;
+  let calls = 0;
+  const poller = pollWhatsAppProfilePicture({
+    isActive: () => active,
+    getOptions: () => { reads += 1; return { ...files.options, updateProfilePicture: async () => { calls += 1; } }; },
+    intervalMs: 5, durationMs: 100,
+  });
+  t.after(() => poller.stop());
+  assert.equal(calls, 0);
+  files.queue();
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(calls, 1);
+  active = false;
+  await new Promise(resolve => setTimeout(resolve, 10));
+  const stoppedReads = reads;
+  await new Promise(resolve => setTimeout(resolve, 15));
+  assert.equal(reads, stoppedReads);
+});
+
+test('poller has a finite lifetime and explicit shutdown cancels its timer', async t => {
+  const files = fixture(t);
+  fs.rmSync(files.requestPath);
+  let reads = 0;
+  const poller = pollWhatsAppProfilePicture({
+    isActive: () => true,
+    getOptions: () => { reads += 1; return files.options; },
+    intervalMs: 5, durationMs: 10,
+  });
+  t.after(() => poller.stop());
+  await new Promise(resolve => setTimeout(resolve, 30));
+  const boundedReads = reads;
+  await new Promise(resolve => setTimeout(resolve, 15));
+  assert.equal(reads, boundedReads);
+  poller.stop();
+});
 
 test('provider void ACK is recorded once per normalized account without the phone number', async t => {
   const files = fixture(t);
@@ -73,6 +164,7 @@ test('a newly approved official asset is applied again', async t => {
   await applyWhatsAppProfilePicture(options);
   const replacement = Buffer.from('new-approved-official-logo');
   fs.writeFileSync(files.imagePath, replacement);
+  files.queue(JID, hash(replacement));
   assert.equal((await applyWhatsAppProfilePicture({
     ...options, expectedImageHash: hash(replacement),
   })).status, 'applied');
@@ -112,6 +204,9 @@ test('missing configured or official image cannot call WhatsApp', async t => {
   let calls = 0;
   const options = { ...files.options, updateProfilePicture: async () => { calls += 1; } };
   assert.deepEqual(await applyWhatsAppProfilePicture({
+    ...options, expectedImageHash: undefined,
+  }), { status: 'missing', errorCode: 'official_image_missing' });
+  assert.deepEqual(await applyWhatsAppProfilePicture({
     ...options, expectedImageHash: null,
   }), { status: 'missing', errorCode: 'official_image_missing' });
   fs.rmSync(files.imagePath);
@@ -141,6 +236,7 @@ test('429 cooldown lasts a day and survives a changed or missing asset', async t
   assert.equal((await applyWhatsAppProfilePicture(changedOptions)).status, 'cooldown');
   assert.equal(calls, 1);
   clock += 86_400_001;
+  files.queue(JID, hash(Buffer.from('changed')), clock);
   assert.equal((await applyWhatsAppProfilePicture(changedOptions)).status, 'failed');
   assert.equal(calls, 2);
   assert.equal(fs.readFileSync(files.statePath, 'utf8').includes('secret'), false);
@@ -175,6 +271,7 @@ test('transport error has uncertain outcome and does not retry after an image ch
   };
   assert.deepEqual(await applyWhatsAppProfilePicture(options), { status: 'uncertain', errorCode: 'update_unconfirmed' });
   fs.writeFileSync(files.imagePath, Buffer.from('changed'));
+  files.queue(JID, hash(Buffer.from('changed')), 99_000_000);
   assert.deepEqual(await applyWhatsAppProfilePicture({
     ...options, expectedImageHash: hash(Buffer.from('changed')), now: () => 99_000_000,
   }), { status: 'uncertain', errorCode: 'update_unconfirmed' });
@@ -194,6 +291,7 @@ test('Baileys disconnection codes do not imply a confirmed rejection or permit r
         throw Object.assign(new Error('socket closed'), { output: { statusCode } });
       },
     };
+    files.queue(options.jid);
     assert.deepEqual(await applyWhatsAppProfilePicture(options), {
       status: 'uncertain', errorCode: 'update_unconfirmed',
     });
@@ -248,6 +346,9 @@ test('concurrent accounts retain both results and duplicate same-account calls a
   };
   const options = { ...files.options, updateProfilePicture };
   const firstResult = applyWhatsAppProfilePicture(options);
+  // First RPC has already been scheduled; another account receives its own request.
+  await new Promise(resolve => setImmediate(resolve));
+  files.queue(secondJid);
   const secondResult = applyWhatsAppProfilePicture({ ...options, jid: secondJid });
   assert.deepEqual(await applyWhatsAppProfilePicture(options), { status: 'pending' });
   second.resolve();

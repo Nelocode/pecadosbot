@@ -1,6 +1,7 @@
 """Read-only, account-scoped status for the WhatsApp profile photo worker."""
 import hashlib
 import json
+import math
 import re
 import time
 from pathlib import Path
@@ -13,6 +14,27 @@ def official_image_matches(image_path: Path, official_path: Path) -> bool:
         ).digest()
     except OSError:
         return False
+
+
+def _pending_whatsapp_request_status(request_path: Path, account_hash: str, image_hash: str):
+    try:
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        if not isinstance(request, dict) or request.get("accountHash") != account_hash:
+            return None
+        if (request.get("brand") != "pecadosvip" or request.get("status") != "pending"
+                or not re.fullmatch(r"[0-9a-f]{32}", str(request.get("requestId", "")))
+                or request.get("imageHash") != image_hash):
+            return {"status": "failed", "message": "La solicitud de foto no corresponde a esta marca y este logotipo."}
+        requested = request.get("requestedAt")
+        expires = request.get("expiresAt")
+        if (not isinstance(requested, (int, float)) or not isinstance(expires, (int, float))
+                or not math.isfinite(requested) or not math.isfinite(expires)
+                or expires - requested != 600_000
+                or not requested <= time.time() * 1000 <= expires):
+            return {"status": "failed", "message": "La solicitud de foto caducó sin una confirmación de WhatsApp."}
+        return {"status": "pending", "message": "El logotipo de PecadosVIP está pendiente para la cuenta recién vinculada."}
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 def whatsapp_profile_picture_status(
@@ -28,14 +50,21 @@ def whatsapp_profile_picture_status(
         account_hash = identity.get("account_hash", "")
         if not isinstance(account_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", account_hash):
             raise ValueError("unknown account")
+        image_hash = hashlib.sha256(official_path.read_bytes()).hexdigest()
+        pending = _pending_whatsapp_request_status(
+            state_path.parent / "wa_profile_picture_request.json", account_hash, image_hash,
+        )
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return {"status": "unknown", "message": "No se pudo verificar la cuenta para consultar su foto."}
+    try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if state.get("version") != 1:
             raise ValueError("unknown version")
         record = state["accounts"][account_hash]
-        if record.get("imageHash") != hashlib.sha256(official_path.read_bytes()).hexdigest():
+        if record.get("imageHash") != image_hash:
             raise ValueError("different image")
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
-        return {"status": "unknown", "message": "Todavía no hay un resultado comprobable para esta cuenta y este logotipo."}
+        return pending or {"status": "unknown", "message": "Todavía no hay un resultado comprobable para esta cuenta y este logotipo."}
 
     status = record.get("status")
     if status == "pending":
