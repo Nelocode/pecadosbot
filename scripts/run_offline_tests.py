@@ -105,6 +105,15 @@ def main(arguments=None):
     def guarded_popen(args, *positional, **kwargs):
         if kwargs.get("shell") or not isinstance(args, (list, tuple)) or not args:
             return deny_worker()
+        # ctypes.find_library reads the Linux loader cache when Telethon imports
+        # SSL. Only its exact read-only query is allowed, never cache updates.
+        if (
+            sys.platform == "linux"
+            and list(args) == ["/sbin/ldconfig", "-p"]
+            and not positional
+            and kwargs.get("executable") is None
+        ):
+            return real_popen(args, **kwargs)
         executable = shutil.which(str(args[0])) or str(args[0])
         override = kwargs.get("executable")
         if node_path is None or Path(executable).resolve() != node_path:
